@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        pipeline: [gc, no-gc, loop-flatten, loop-flatten-no-gc]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y llvm-18-dev clang-18 libclang-18-dev
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y cmake libssl-dev
+
+      - name: Build and install emp-tool
+        run: |
+          git clone --depth 1 https://github.com/emp-toolkit/emp-tool.git
+          cd emp-tool && cmake -B build && cmake --build build -j$(nproc)
+          sudo cmake --install build
+
+      - name: Build and install emp-ot
+        run: |
+          git clone --depth 1 https://github.com/emp-toolkit/emp-ot.git
+          cd emp-ot && cmake -B build && cmake --build build -j$(nproc)
+          sudo cmake --install build
+
+      - name: Build and install emp-sh2pc
+        run: |
+          git clone --depth 1 https://github.com/emp-toolkit/emp-sh2pc.git
+          cd emp-sh2pc && cmake -B build && cmake --build build -j$(nproc)
+          sudo cmake --install build
+
+      - name: Build and install emp-aby
+        run: |
+          git clone --depth 1 -b no-open-fhe https://github.com/radhika1601/ScalableMixedModeMPC.git emp-aby
+          cd emp-aby && cmake -B build && cmake --build build -j$(nproc)
+          sudo cmake --install build
+
+      - name: Build runtime
+        run: |
+          cd runtime && mkdir -p build && cd build
+          cmake .. && make -j$(nproc)
+          sudo make install
+
+      - name: Build passes
+        run: |
+          cd passes && mkdir -p build && cd build
+          cmake .. && make -j$(nproc)
+
+      - name: Run tests (gc)
+        if: matrix.pipeline == 'gc'
+        run: cd benchmarks && make run
+
+      - name: Run tests (no-gc)
+        if: matrix.pipeline == 'no-gc'
+        run: cd benchmarks && make run-no-gc
+
+      - name: Run tests (loop-flatten)
+        if: matrix.pipeline == 'loop-flatten'
+        run: cd benchmarks && make run-loop-flatten
+
+      - name: Run tests (loop-flatten-no-gc)
+        if: matrix.pipeline == 'loop-flatten-no-gc'
+        run: cd benchmarks && make run-loop-flatten-no-gc

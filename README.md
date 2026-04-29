@@ -18,7 +18,7 @@ Smaug is an LLVM-based compiler that transforms standard C/C++ and Rust programs
 - LLVM 18 (`apt install llvm-18 clang-18`)
 - CMake 3.22+
 - OpenSSL development libraries
-- [EMP toolkit](https://github.com/emp-toolkit): emp-tool, emp-ot, emp-aby
+- [EMP toolkit](https://github.com/emp-toolkit): emp-tool, emp-ot, emp-sh2pc, [emp-aby](https://github.com/radhika1601/ScalableMixedModeMPC)
 
 See [docs/install.md](docs/install.md) for detailed installation instructions.
 
@@ -91,11 +91,11 @@ smaug/
 If you use Smaug in your research, please cite:
 
 ```bibtex
-@inproceedings{smaug2025,
-  title={Smaug: Modular Augmentation of LLVM for MPC},
+@INPROCEEDINGS{11023285,
   author={Garg, Radhika and Wang, Xiao},
-  year={2025}
-}
+  booktitle={2025 IEEE Symposium on Security and Privacy (SP)}, 
+  title={Smaug: Modular Augmentation of LLVM for MPC}, 
+  year={2025}}
 ```
 
 ## License

@@ -41,8 +41,14 @@ cd emp-ot && cmake -B build && cmake --build build -j$(nproc)
 sudo cmake --install build
 cd ..
 
+# emp-sh2pc (semi-honest 2PC)
+git clone --depth 1 https://github.com/emp-toolkit/emp-sh2pc.git
+cd emp-sh2pc && cmake -B build && cmake --build build -j$(nproc)
+sudo cmake --install build
+cd ..
+
 # emp-aby (Yao and GMW protocols)
-git clone https://github.com/emp-toolkit/emp-aby.git
+git clone -b no-open-fhe https://github.com/radhika1601/ScalableMixedModeMPC.git emp-aby
 cd emp-aby && cmake -B build && cmake --build build -j$(nproc)
 sudo cmake --install build
 cd ..
