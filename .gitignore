@@ -1,0 +1,27 @@
+# Build directories
+build/
+passes/build/
+runtime/build/
+benchmarks/build/
+
+# Compiled outputs
+*.o
+*.so
+*.a
+*_mpc
+
+# LLVM IR outputs
+benchmarks/*.ll
+test/*.ll
+
+# Test data
+benchmarks/data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store

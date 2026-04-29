@@ -1,0 +1,25 @@
+{
+    "_Z10mnist_reluPiiS_": {
+        "input": [
+            1,
+            0,
+            1
+        ],
+        "readAccess": {
+            "0": 1,
+            "2": 1
+        },
+        "writeAccess": {
+            "2": 1
+        },
+        "sizes": {
+            "0": 32,
+            "2": 32
+        },
+        "output": 0
+    },
+    "main": {
+        "input": [],
+        "output": 0
+    }
+}
