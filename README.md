@@ -82,7 +82,6 @@ smaug/
   passes/       LLVM transformation passes (libpasses.so)
   runtime/      MPC runtime libraries (libgc-opt, libmpc)
   benchmarks/   Benchmark programs and test pipeline
-  test/         Test utilities
   docs/         Documentation
 ```
 
