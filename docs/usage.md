@@ -47,18 +47,24 @@ Create a JSON file describing which function arguments are secret-shared:
 ```json
 {
     "my_function": {
-        "secret_input": {
-            "type": "read",
-            "size": "N",
-            "elementSize": 32
-        }
+        "input": [1, 1, 0, 0],
+        "readAccess": {
+            "0": 2,
+            "1": 3
+        },
+        "sizes": {
+            "0": 32,
+            "1": 32
+        },
+        "output": 1
     }
 }
 ```
 
-- `type`: `"read"` (input), `"write"` (output), or `"readwrite"`
-- `size`: argument name or constant for array length
-- `elementSize`: bit width (32 for int, 8 for bool/char, 64 for long)
+- `input`: array of `0`/`1` flags, one per argument in order — `1` means the argument is private/secret-shared
+- `readAccess`: maps a pointer argument's index to the index of the argument that holds its array length (omit if no pointer inputs are secret-shared)
+- `sizes`: maps a pointer argument's index to its element bit-width (32 for `int`, 8 for `char`/`bool`, 64 for `long`) — only needed for private pointer inputs
+- `output`: `1` if the return value is private/secret-shared, `0` otherwise
 
 ### 3. Compile
 
@@ -109,18 +115,24 @@ Arguments: `<party_id> <port> <input_size>`
 
 ## Metadata Format
 
-The metadata JSON maps function names to their secret-shared arguments:
+The metadata JSON maps mangled function names to their privacy annotations:
 
 ```json
 {
     "function_name": {
-        "arg_name": {
-            "type": "read|write|readwrite",
-            "size": "size_arg_name|constant",
-            "elementSize": 32
-        }
+        "input": [<arg0_private>, <arg1_private>, ...],
+        "readAccess": { "<ptr_arg_index>": <length_arg_index>, ... },
+        "sizes": { "<ptr_arg_index>": <element_bits>, ... },
+        "output": <return_private>
     }
 }
 ```
 
-Multiple arguments can be annotated per function. The `size` field references another function argument by name or uses a numeric constant.
+| Field | Type | Description |
+|-------|------|-------------|
+| `input` | array of `0`/`1` | One entry per argument in declaration order; `1` = private |
+| `readAccess` | object (optional) | Maps each private pointer argument's index to the index of the argument that holds its array length |
+| `sizes` | object (optional) | Maps each private pointer argument's index to its element size in bits |
+| `output` | `0` or `1` | `1` if the return value is private/secret-shared |
+
+`readAccess` and `sizes` are only required for functions with private pointer (array) inputs. Functions with no pointer inputs (e.g. `main`) can omit them and set `input` to `[]`.
