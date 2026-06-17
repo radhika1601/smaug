@@ -29,23 +29,9 @@ sudo apt install cmake git build-essential libssl-dev
 Smaug uses the [EMP toolkit](https://github.com/emp-toolkit) for MPC protocol backends.
 
 ```bash
-# emp-tool (core library)
-git clone https://github.com/emp-toolkit/emp-tool.git
-cd emp-tool && cmake -B build && cmake --build build -j$(nproc)
-sudo cmake --install build
-cd ..
-
-# emp-ot (oblivious transfer)
-git clone https://github.com/emp-toolkit/emp-ot.git
-cd emp-ot && cmake -B build && cmake --build build -j$(nproc)
-sudo cmake --install build
-cd ..
-
-# emp-sh2pc (semi-honest 2PC)
-git clone --depth 1 https://github.com/emp-toolkit/emp-sh2pc.git
-cd emp-sh2pc && cmake -B build && cmake --build build -j$(nproc)
-sudo cmake --install build
-cd ..
+# emp-tool (core library), emp-ot (oblivious transfer), emp-sh2pc (semi-honest 2PC GC)
+wget -q https://raw.githubusercontent.com/emp-toolkit/emp-readme/master/scripts/install.py
+python3 install.py --deps --tool v0.3.x --ot v0.3.x --sh2pc v0.3.x
 
 # emp-aby (Yao and GMW protocols)
 git clone -b no-open-fhe https://github.com/radhika1601/ScalableMixedModeMPC.git emp-aby
