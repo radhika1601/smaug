@@ -10,11 +10,9 @@
 #include "CheckSecretShared.h"
 #include "MPCVecUtils.h"
 
-extern cl::opt<std::string> MetadataFilePath;
+#include "Options.h"
 
-cl::opt<bool> UseGCMode("gc",
-    cl::desc("Use garbled-circuit (gc-opt) MPC runtime (default: true)"),
-    cl::init(true));
+extern cl::opt<std::string> MetadataFilePath;
 
 std::pair<Value *, Value *> VectorMPCLinkPass::getOpCount(Loop *L,
                                                           PHINode *induction) {
@@ -196,7 +194,6 @@ Instruction *VectorMPCLinkPass::makeSecretSharedVec(Value *val, Value *opCount,
         // Get or insert the malloc and free functions
         // errs() << "create vector for " << *val << "\n";Value *elementPtr;
         Value *elementPtr;
-        bool useBitStore = false;
         if (gc) {
           std::string name = "init";
           Value *initVal = val;
@@ -206,7 +203,6 @@ Instruction *VectorMPCLinkPass::makeSecretSharedVec(Value *val, Value *opCount,
             // i8 boolean stored in Bit buffer: convert to i1 and use getBitEb
             name += "1";
             initVal = Builder.CreateICmpNE(val, ConstantInt::get(Builder.getInt8Ty(), 0));
-            useBitStore = true;
           } else if (val->getType() == Builder.getInt16Ty())
             name += "16";
           else if (val->getType() == Builder.getInt32Ty())
@@ -227,14 +223,11 @@ Instruction *VectorMPCLinkPass::makeSecretSharedVec(Value *val, Value *opCount,
           Builder.CreateStore(val, elementPtr);
         }
         Value *n = Builder.CreateTruncOrBitCast(opCount, Builder.getInt32Ty());
-        if (gc)
-          Builder.CreateCall(
-              storeFunc, {newPtr, elementPtr, n, Builder.getInt32(elementSize),
-                          Builder.getInt1(useBitStore), Builder.getInt1(false)});
-        else
-          Builder.CreateCall(
-              storeFunc, {newPtr, elementPtr, n, Builder.getInt32(elementSize),
-                          Builder.getInt1(true), Builder.getInt1(false)});
+        // In both modes elementPtr holds a value of the buffer's own kind
+        // (an MPC Bit/Integer in gc mode), so it is stored as shared.
+        Builder.CreateCall(
+            storeFunc, {newPtr, elementPtr, n, Builder.getInt32(elementSize),
+                        Builder.getInt1(true), Builder.getInt1(false)});
       }
       return newPtr;
     }
@@ -822,6 +815,80 @@ void VectorMPCLinkPass::updateReduction(
     CI->replaceAllUsesWith(newResLoaded);
   }
 }
+// Lowers `xor v, splat(-1)`, i.e. a vector NOT. The loop vectorizer emits it
+// for any-of reductions, e.g. `reduce.or(xor(v, splat(true)))`.
+void VectorMPCLinkPass::updateNot(
+    Instruction &I, Instruction *induction, Value *opCount,
+    IRBuilder<> &Builder, SmallVector<Instruction *> &deleteInstructions,
+    MapVector<Value *, Instruction *> &ItoPtr, Loop *L) {
+  Value *op = I.getOperand(0);
+  Constant *ones = dyn_cast<Constant>(I.getOperand(1));
+  if (!ones || !ones->isAllOnesValue()) {
+    op = I.getOperand(1);
+    ones = dyn_cast<Constant>(I.getOperand(0));
+  }
+  if (!ones || !ones->isAllOnesValue()) {
+    LLVM_DEBUG(dbgs() << I << " xor without an all-ones operand\n");
+    return;
+  }
+  std::string name = getTypeName(I.getType(), Builder);
+  if (name == "" || name == "f") {
+    LLVM_DEBUG(dbgs() << I << " not type not implemented\n");
+    return;
+  }
+
+  BasicBlock *BB = I.getParent();
+  Function *F = BB->getParent();
+  Builder.SetInsertPoint(&I);
+  Instruction *ptr = getOperandPtr(op, induction, opCount, Builder, BB, ItoPtr, L);
+  // For non-gc, resolve the all-ones vector before getResPtr so that its
+  // malloc dominates the xor call.
+  Instruction *onesPtr = nullptr;
+  if (!gc)
+    onesPtr = getOperandPtr(ones, induction, opCount, Builder, BB, ItoPtr, L);
+  if (!ptr || (!gc && !onesPtr)) {
+    LLVM_DEBUG(dbgs() << I << " operand vector not found\n");
+    return;
+  }
+  Builder.SetInsertPoint(&I);
+  Instruction *resPtr =
+      getResPtr(&I, induction, opCount, Builder, F, deleteInstructions, L);
+  Value *n = Builder.CreateTrunc(opCount, Type::getInt32Ty(F->getContext()));
+  llvm::Function *func;
+  if (gc) {
+    func = cast<llvm::Function>(
+        F->getParent()
+            ->getOrInsertFunction(
+                GCFuncNames[(name == "1" || name == "8") ? "not1" : "not"],
+                FunctionType::get(Builder.getVoidTy(),
+                                  {Builder.getPtrTy(), Builder.getPtrTy(),
+                                   Builder.getInt32Ty()},
+                                  false))
+            .getCallee());
+  } else {
+    func = cast<llvm::Function>(
+        F->getParent()
+            ->getOrInsertFunction(
+                FuncNames["xor" + name],
+                FunctionType::get(Builder.getVoidTy(),
+                                  {Builder.getPtrTy(), Builder.getPtrTy(),
+                                   Builder.getPtrTy(), Builder.getInt32Ty(),
+                                   Builder.getInt1Ty()},
+                                  false))
+            .getCallee());
+  }
+  auto insertPoint = resPtr->getInsertionPointAfterDef().value();
+  if (resPtr->getParent() == BB && resPtr->comesBefore(&I))
+    insertPoint = I.getInsertionPointAfterDef().value();
+  Builder.SetInsertPoint(insertPoint);
+  if (gc)
+    Builder.CreateCall(func, {ptr, resPtr, n});
+  else
+    Builder.CreateCall(func, {ptr, onesPtr, resPtr, n, Builder.getInt1(true)});
+  ItoPtr.insert(std::make_pair(&I, resPtr));
+  deleteInstructions.push_back(&I);
+}
+
 /* Incomplete yet */
 void VectorMPCLinkPass::updateSelect(
     Instruction &I, Instruction *induction, Value *opCount,
@@ -885,10 +952,13 @@ void VectorMPCLinkPass::updateSelect(
   if (gc)
     Builder.CreateCall(Func, {op0Inst, op1Inst, condition, resPtr, n});
   else
+    // The select is secret when the instruction is, even if its result
+    // buffer is not marked, e.g. the phi buffer of an any-of reduction.
     Builder.CreateCall(
         Func,
         {op0Inst, op1Inst, condition, n, Builder.getInt32(elementSize), resPtr,
-         Builder.getInt1(checkSecretShared->isSecretShared(resPtr, F))});
+         Builder.getInt1(checkSecretShared->isSecretShared(&I, F) ||
+                         checkSecretShared->isSecretShared(resPtr, F))});
   deleteInstructions.push_back(&I);
 }
 
@@ -1222,12 +1292,90 @@ void VectorMPCLinkPass::updateType(
   deleteInstructions.push_back(&I);
 }
 
+// Rebuilds an index expression with every llvm.vscale call replaced by the
+// loop's element count, since the lowered loop runs once over all elements.
+static Value *replaceVScale(Value *v, Value *opCount, IRBuilder<> &Builder) {
+  if (auto *CI = dyn_cast<CallInst>(v))
+    if (CI->getCalledFunction() &&
+        CI->getCalledFunction()->getIntrinsicID() == Intrinsic::vscale)
+      return Builder.CreateZExtOrTrunc(opCount, v->getType());
+  if (auto *BO = dyn_cast<BinaryOperator>(v)) {
+    Value *a = replaceVScale(BO->getOperand(0), opCount, Builder);
+    Value *b = replaceVScale(BO->getOperand(1), opCount, Builder);
+    if (a == BO->getOperand(0) && b == BO->getOperand(1))
+      return v;
+    return Builder.CreateBinOp(BO->getOpcode(), a, b);
+  }
+  if (auto *Cast = dyn_cast<CastInst>(v)) {
+    Value *a = replaceVScale(Cast->getOperand(0), opCount, Builder);
+    if (a == Cast->getOperand(0))
+      return v;
+    return Builder.CreateCast(Cast->getOpcode(), a, Cast->getDestTy());
+  }
+  return v;
+}
+
+// Lowers `extractelement v, idx` on a scalable vector to a scalar load of
+// element idx from v's MPC buffer. The loop vectorizer emits it to take the
+// last lane of a select, e.g. the index of the last match in a loop.
+void VectorMPCLinkPass::updateExtract(
+    ExtractElementInst &I, Instruction *induction, Value *opCount,
+    IRBuilder<> &Builder, SmallVector<Instruction *> &deleteInstructions,
+    MapVector<Value *, Instruction *> &ItoPtr, Loop *L) {
+  if (!I.getVectorOperandType()->isScalableTy())
+    return;
+  BasicBlock *BB = I.getParent();
+  Function *F = BB->getParent();
+  Builder.SetInsertPoint(&I);
+  Instruction *vecPtr = getOperandPtr(I.getVectorOperand(), induction, opCount,
+                                      Builder, BB, ItoPtr, L);
+  if (!vecPtr) {
+    LLVM_DEBUG(dbgs() << I << " vector operand not found\n");
+    return;
+  }
+  Builder.SetInsertPoint(&I);
+  Value *idx = Builder.CreateZExtOrTrunc(
+      replaceVScale(I.getIndexOperand(), opCount, Builder),
+      Builder.getInt64Ty());
+  Type *elTy = I.getType();
+  Value *elPtr;
+  if (gc) {
+    bool isBit = elTy == Builder.getInt1Ty() || elTy == Builder.getInt8Ty();
+    std::string gepName = isBit ? "_ZN3MPC3gepEPN3emp3BitE" MPC_I64
+                                : "_ZN3MPC3gepEPN3emp7IntegerE" MPC_I64;
+    Function *gepFunc = cast<Function>(
+        F->getParent()
+            ->getOrInsertFunction(
+                gepName, FunctionType::get(Builder.getPtrTy(),
+                                           {Builder.getPtrTy(),
+                                            Builder.getInt64Ty()},
+                                           false))
+            .getCallee());
+    elPtr = Builder.CreateCall(gepFunc, {vecPtr, idx});
+  } else {
+    elPtr = Builder.CreateGEP(elTy, vecPtr, idx);
+  }
+  LoadInst *loaded = Builder.CreateLoad(elTy, elPtr);
+  if (checkSecretShared->isSecretShared(&I, F)) {
+    setSecretShared(loaded);
+    if (Instruction *elPtrInst = dyn_cast<Instruction>(elPtr))
+      setSecretShared(elPtrInst);
+  }
+  I.replaceAllUsesWith(loaded);
+  deleteInstructions.push_back(&I);
+}
+
 void VectorMPCLinkPass::updateInst(
     Instruction &I, Instruction *induction, Value *opCount,
     IRBuilder<> &Builder, SmallVector<Instruction *> &deleteInstructions,
     MapVector<Value *, Instruction *> &ItoPtr, Loop *L) {
   BasicBlock *BB = I.getParent();
   Module *module = BB->getParent()->getParent();
+  if (auto *EE = dyn_cast<ExtractElementInst>(&I)) {
+    updateExtract(*EE, induction, opCount, Builder, deleteInstructions, ItoPtr,
+                  L);
+    return;
+  }
   if (!I.getType()->isScalableTy() ||
       !I.getOperand(0)->getType()->isScalableTy())
     return;
@@ -1310,7 +1458,9 @@ void VectorMPCLinkPass::updateInst(
               L);
     break;
   // case Instruction::And:
-  // case Instruction::Xor:
+  case Instruction::Xor:
+    updateNot(I, induction, opCount, Builder, deleteInstructions, ItoPtr, L);
+    break;
   case Instruction::FMul:
   case Instruction::FAdd:
   case Instruction::FSub:
@@ -1572,6 +1722,10 @@ llvm::PreservedAnalyses VectorMPCLinkPass::run(Module &M,
             for (auto p : checkSecretShared->readArgAccess[&F]) {
               Value *arg = p.first;
               Value *n = p.second;
+              // An argument the function never uses may be passed as poison
+              // by its callers, so it must not be read.
+              if (arg->use_empty())
+                continue;
               // Ensure the arg has a unique name so the "<name>.mpc" instruction
               // can be matched by MPCLink's name-based lookup.  Unnamed args
               // (getName() == "") all get the same ".mpc" suffix, causing
@@ -1607,7 +1761,8 @@ llvm::PreservedAnalyses VectorMPCLinkPass::run(Module &M,
             checkSecretShared->writeArgAccess.end()) {
           for (auto p : checkSecretShared->writeArgAccess[&F]) {
             Value *arg = p.first;
-            if (writeArgtoMPCtype.find(arg) != writeArgtoMPCtype.end())
+            if (arg->use_empty() ||
+                writeArgtoMPCtype.find(arg) != writeArgtoMPCtype.end())
               continue;
             auto it = argToMPCtype.find(arg);
             if (it != argToMPCtype.end()) {
@@ -1667,6 +1822,22 @@ llvm::PreservedAnalyses VectorMPCLinkPass::run(Module &M,
                           Builder.getInt1Ty())
                         type = Builder.getInt1Ty();
                     }
+                  } else if (auto *MT = dyn_cast<MemTransferInst>(U)) {
+                    // A buffer only copied to or from another buffer (e.g.
+                    // after loop-idiom) takes the other buffer's type.
+                    Value *other = MT->getRawDest() == tmp ? MT->getRawSource()
+                                                           : MT->getRawDest();
+                    if (auto *OI = dyn_cast<Instruction>(other)) {
+                      for (auto [md, bits] :
+                           {std::pair{"int8", 8}, {"int16", 16},
+                            {"int32", 32}, {"int64", 64}})
+                        if (OI->hasMetadata(md))
+                          type = Builder.getIntNTy(bits);
+                    } else if (isa<Argument>(other) &&
+                               checkSecretShared->sizesMap[&F].count(other)) {
+                      type = Builder.getIntNTy(
+                          checkSecretShared->sizesMap[&F][other]);
+                    }
                   } else if (CallInst *tmpCI = dyn_cast<CallInst>(U)) {
                     if (tmpCI->getCalledFunction() &&
                         tmpCI->getCalledFunction()->getName().str() ==
@@ -1691,24 +1862,12 @@ llvm::PreservedAnalyses VectorMPCLinkPass::run(Module &M,
               }
               Builder.SetInsertPoint(ci);
               if (!gc) {
-                // Non-gc: reuse the original malloc's byte-count directly.
-                // This emits a single malloc call (like gc's createIntEl),
-                // avoiding intermediate mul/zext that shift the builder and
-                // cause dominance errors.
-                auto *mallocFn = cast<Function>(
-                    F.getParent()
-                        ->getOrInsertFunction("malloc",
-                            FunctionType::get(Builder.getPtrTy(),
-                                              Builder.getInt64Ty(), false))
-                        .getCallee());
-                Value *byteCount = Builder.CreateZExtOrBitCast(
-                    n, Builder.getInt64Ty());
-                auto mpcCall = Builder.CreateCall(mallocFn, byteCount, ".ptr");
-                Instruction *ptrInst = dyn_cast<Instruction>(mpcCall);
-                if (ci->hasMetadata("secret_shared"))
-                  setSecretShared(ptrInst);
-                argToMPCtype.insert(std::make_pair(ci, ptrInst));
-                insertPtrToMPCPtr(ci, ptrInst);
+                // Non-gc buffers hold plain shares with the original layout,
+                // so the vector and scalar loops share the original malloc.
+                // A separate buffer would be read by the vector loops while
+                // the scalar loops still write the original, because mpc-link
+                // only redirects stores in gc mode.
+                argToMPCtype.insert(std::make_pair(ci, ci));
                 continue;
               }
               if (type != Builder.getInt8Ty()) {
@@ -1775,8 +1934,8 @@ llvm::PreservedAnalyses VectorMPCLinkPass::run(Module &M,
               if (srcCI->getCalledFunction() &&
                   srcCI->getCalledFunction()->getName() == GCFuncNames["createBit"])
                 isBit = true;
-            std::string gepName = isBit ? "_ZN3MPC3gepEPN3emp3BitEl"
-                                        : "_ZN3MPC3gepEPN3emp7IntegerEl";
+            std::string gepName = isBit ? "_ZN3MPC3gepEPN3emp3BitE" MPC_I64
+                                        : "_ZN3MPC3gepEPN3emp7IntegerE" MPC_I64;
             std::string storeName = isBit ? "_ZN3MPC5storeEPN3emp3BitERS1_"
                                           : "_ZN3MPC5storeEPN3emp7IntegerERS1_";
             auto *gepFunc = cast<Function>(
