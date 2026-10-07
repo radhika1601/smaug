@@ -5,6 +5,11 @@
 #include <fstream>
 #include <iostream>
 
+// Directory holding the installed circuit files. Set by runtime/CMakeLists.txt.
+#ifndef MPC_CIRCUIT_DIR
+#define MPC_CIRCUIT_DIR "/usr/local/include/mpc/circuits/"
+#endif
+
 namespace MPC {
 PRG prg;
 int party;
@@ -74,20 +79,16 @@ inline void compute_min_max(T *input1, T *input2, T *res, int n,
                    sizeof(T) * 8);
   }
   if (gt[(int)log2(sizeof(T))] == nullptr) {
-    string name = "/usr/local/include/mpc/circuits/gt";
+    string name = MPC_CIRCUIT_DIR "gt";
     name += std::to_string(sizeof(T) * 8) + ".txt";
     gt[(int)log2(sizeof(T))] =
         new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
   }
   gt[(int)log2(sizeof(T))]->compute<NetIO>(o, i1, n, true);
+  // The gt circuit has one output bit per instance: instance i is o[i].
   bool *condition = new bool[n];
-  for (int i = 0; i < n; ++i) {
-    int8_t x = bool_to_int<int8_t>(o + i * 8);
-    if (x == 0)
-      condition[i] = false;
-    else
-      condition[i] = true;
-  }
+  for (int i = 0; i < n; ++i)
+    condition[i] = o[i];
   if (max) {
     select(input1, input2, condition, n, sizeof(T), res, true);
   } else
@@ -281,7 +282,7 @@ void divide(void *a, void *b, int n, int elementSize, void *res, bool shared) {
   }
 
   if (div[(int)log2(elementSize)] == nullptr) {
-    string name = "/usr/local/include/mpc/circuits/div";
+    string name = MPC_CIRCUIT_DIR "div";
     name += std::to_string(elementSize * 8) + ".txt";
     div[(int)log2(elementSize)] =
         new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -430,8 +431,40 @@ void select(void *trueVal, void *falseVal, bool *condition, int n,
   }
 }
 
+// OR over n bools (elementSize 0). With XOR shares, OR(x) = NOT(AND(NOT x)),
+// and a NOT is applied by party 1 only.
+static void reduceOrBool(bool *arr, int n, bool *res, bool shared) {
+  if (!shared) {
+    bool r = false;
+    for (int i = 0; i < n; ++i)
+      r |= arr[i];
+    res[0] = r;
+    return;
+  }
+  bool flip = party == 1;
+  std::unique_ptr<bool[]> in = std::make_unique<bool[]>(n);
+  for (int i = 0; i < n; ++i)
+    in[i] = arr[i] ^ flip;
+  int m = n;
+  while (m > 1) {
+    int half = m / 2;
+    simd_circ->and_gate(in.get(), in.get(), in.get() + half, half);
+    if (m % 2)
+      in[half] = in[m - 1];
+    m = half + m % 2;
+  }
+  res[0] = in[0] ^ flip;
+}
+
 void reduction(void *arr, int n, int elementSize, void *res, int op,
                bool shared) {
+  if (elementSize == 0) {
+    if (op == reductionOp::OR)
+      reduceOrBool((bool *)arr, n, (bool *)res, shared);
+    else
+      printf("reduction: op %d not implemented for bool vectors\n", op);
+    return;
+  }
   if (!shared) {
     if (log2(elementSize) == 0)
       redHelper<int8_t>((int8_t *)arr, (int8_t *)res, n, op);
@@ -473,7 +506,7 @@ void reduction(void *arr, int n, int elementSize, void *res, int op,
   Circuit<SIMDCircExec<NetIO>> *circ;
   if (op == reductionOp::ADD) {
     if (adder[(int)log2(elementSize)] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/adder";
+      string name = MPC_CIRCUIT_DIR "adder";
       name += std::to_string(elementSize * 8) + ".txt";
       adder[(int)log2(elementSize)] =
           new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -481,7 +514,7 @@ void reduction(void *arr, int n, int elementSize, void *res, int op,
     circ = adder[(int)log2(elementSize)];
   } else if (op == reductionOp::MUL) {
     if (mult[(int)log2(elementSize)] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/mult";
+      string name = MPC_CIRCUIT_DIR "mult";
       name += std::to_string(elementSize * 8) + ".txt";
       mult[(int)log2(elementSize)] =
           new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -489,7 +522,7 @@ void reduction(void *arr, int n, int elementSize, void *res, int op,
     circ = mult[(int)log2(elementSize)];
   } else if (op == reductionOp::MAX || op == reductionOp::MIN) {
     if (gt[(int)log2(elementSize)] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/gt";
+      string name = MPC_CIRCUIT_DIR "gt";
       name += std::to_string(elementSize * 8) + ".txt";
       gt[(int)log2(elementSize)] =
           new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -506,11 +539,9 @@ void reduction(void *arr, int n, int elementSize, void *res, int op,
       bool *cmp = new bool[l_floor * 8];
       circ->compute<NetIO>(cmp, in.get(), l_floor, true);
       bool *condition = new bool[l_floor * elementSize * 8];
-      for (int i = 0; i < l_floor; ++i) {
-        int8_t x = bool_to_int<int8_t>(cmp + i * 8);
-        memset(condition + (i * elementSize * 8), x == 0 ? false : true,
-               elementSize * 8);
-      }
+      // One output bit per instance: instance i is cmp[i].
+      for (int i = 0; i < l_floor; ++i)
+        memset(condition + (i * elementSize * 8), cmp[i], elementSize * 8);
       int offset = 0;
       if (op == reductionOp::MIN)
         offset = l_floor * elementSize * 8;
@@ -557,6 +588,21 @@ void reduction(void *arr, int n, int elementSize, void *res, int op,
     std::cout << "reduction\n";
   }
   prev_depth = simd_circ->depth;
+}
+
+// Entry points for the smaug ABI (abi_gmw.cpp). The emp-aby headers define
+// non-inline functions, so they are included only in this file.
+void abiAndGate(bool *out, bool *a, bool *b, size_t n) {
+  simd_circ->and_gate(out, a, b, n);
+}
+
+void abiRunCircuit(const char *path, bool *out, bool *in, unsigned num) {
+  static std::map<std::string, std::unique_ptr<Circuit<SIMDCircExec<NetIO>>>>
+      cache;
+  auto &c = cache[path];
+  if (!c)
+    c.reset(new Circuit<SIMDCircExec<NetIO>>(path, party, simd_circ));
+  c->compute<NetIO>(out, in, num, true);
 }
 
 int rand_int32() {
@@ -634,58 +680,58 @@ void setup(int p, int port) {
             << simd_circ->num_block_triples_pool * 128 << " \n";
 
   // adder[0] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/adder8.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "adder8.txt", party, simd_circ);
   // adder[1] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/adder16.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "adder16.txt", party, simd_circ);
   // adder[2] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/adder32.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "adder32.txt", party, simd_circ);
   // adder[3] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/adder64.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "adder64.txt", party, simd_circ);
 
   // mult[0] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/mult8.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "mult8.txt", party, simd_circ);
   // mult[1] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/mult16.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "mult16.txt", party, simd_circ);
   // mult[2] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/mult32.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "mult32.txt", party, simd_circ);
   // mult[3] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/mult64.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "mult64.txt", party, simd_circ);
 
   // eq[0] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/icmpeq8.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "icmpeq8.txt", party, simd_circ);
   // eq[1] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/icmpeq16.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "icmpeq16.txt", party, simd_circ);
   // eq[2] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/icmpeq32.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "icmpeq32.txt", party, simd_circ);
   // eq[3] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/icmpeq64.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "icmpeq64.txt", party, simd_circ);
 
   // gt[0] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/gt8.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "gt8.txt", party, simd_circ);
   // gt[1] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/gt16.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "gt16.txt", party, simd_circ);
   // gt[2] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/gt32.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "gt32.txt", party, simd_circ);
   // gt[3] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/gt64.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "gt64.txt", party, simd_circ);
 
   // ge[0] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/ge8.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "ge8.txt", party, simd_circ);
   // ge[1] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/ge16.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "ge16.txt", party, simd_circ);
   // ge[2] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/ge32.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "ge32.txt", party, simd_circ);
   // ge[3] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/ge64.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "ge64.txt", party, simd_circ);
 
   // sub[0] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/sub8.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "sub8.txt", party, simd_circ);
   // sub[1] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/sub16.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "sub16.txt", party, simd_circ);
   // sub[2] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/sub32.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "sub32.txt", party, simd_circ);
   // sub[3] = new Circuit<SIMDCircExec<NetIO>>(
-  //     "/usr/local/include/mpc/circuits/sub64.txt", party, simd_circ);
+  //     MPC_CIRCUIT_DIR "sub64.txt", party, simd_circ);
 }
 template <typename T>
 void loadStoreHelper(bool *vals, int32_t idx, int32_t n, bool *andOutput) {
@@ -701,7 +747,7 @@ void loadStoreHelper(bool *vals, int32_t idx, int32_t n, bool *andOutput) {
   bool *cmp = new bool[n];
   if (!eq[2])
     eq[2] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/icmpeq32.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "icmpeq32.txt", party, simd_circ);
 
   eq[2]->compute<NetIO>(cmp, input, n, true);
 
@@ -803,7 +849,7 @@ void store(void *arr, void *val, int32_t idx, int32_t n, int32_t elementSize,
   }
 
   if (sub[(int)log2(elementSize)] == nullptr) {
-    string name = "/usr/local/include/mpc/circuits/sub";
+    string name = MPC_CIRCUIT_DIR "sub";
     name += std::to_string(elementSize * 8) + ".txt";
     sub[(int)log2(elementSize)] =
         new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -836,7 +882,7 @@ void store(void *arr, void *val, int32_t idx, int32_t n, int32_t elementSize,
 
   memset(vals, 0, n * elementSize * 8);
   if (adder[(int)log2(elementSize)] == nullptr) {
-    string name = "/usr/local/include/mpc/circuits/adder";
+    string name = MPC_CIRCUIT_DIR "adder";
     name += std::to_string(elementSize * 8) + ".txt";
     adder[(int)log2(elementSize)] =
         new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -974,42 +1020,42 @@ void xorI64(int64_t *input1, int64_t *input2, int64_t *output, int n,
 void addI8(int8_t *input1, int8_t *input2, int8_t *output, int n) {
   if (!adder[0])
     adder[0] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adder8.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adder8.txt", party, simd_circ);
   compute<int8_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                 adder[0]);
 }
 void addI16(int16_t *input1, int16_t *input2, int16_t *output, int n) {
   if (!adder[1])
     adder[1] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adder16.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adder16.txt", party, simd_circ);
   compute<int16_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  adder[1]);
 }
 void addI32(int32_t *input1, int32_t *input2, int32_t *output, int n) {
   if (!adder[2])
     adder[2] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adder32.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adder32.txt", party, simd_circ);
   compute<int32_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  adder[2]);
 }
 void addI64(int64_t *input1, int64_t *input2, int64_t *output, int n) {
   if (!adder[3])
     adder[3] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adder64.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adder64.txt", party, simd_circ);
   compute<int64_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  adder[3]);
 }
 void subI8(int8_t *input1, int8_t *input2, int8_t *output, int n) {
   if (!sub[0])
     sub[0] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/sub8.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "sub8.txt", party, simd_circ);
   compute<int8_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                 sub[0]);
 }
 void subI16(int16_t *input1, int16_t *input2, int16_t *output, int n) {
   if (!sub[1])
     sub[1] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/sub16.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "sub16.txt", party, simd_circ);
   compute<int16_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  sub[1]);
 }
@@ -1017,7 +1063,7 @@ void subI16(int16_t *input1, int16_t *input2, int16_t *output, int n) {
 void subI32(int32_t *input1, int32_t *input2, int32_t *output, int n) {
   if (!sub[2])
     sub[2] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/sub32.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "sub32.txt", party, simd_circ);
   compute<int32_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  sub[2]);
 
@@ -1029,21 +1075,21 @@ void subI32(int32_t *input1, int32_t *input2, int32_t *output, int n) {
 void subI64(int64_t *input1, int64_t *input2, int64_t *output, int n) {
   if (!sub[3])
     sub[3] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/sub64.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "sub64.txt", party, simd_circ);
   compute<int64_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  sub[3]);
 }
 void multI8(int8_t *input1, int8_t *input2, int8_t *output, int n) {
   if (!mult[0])
     mult[0] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/mult8.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "mult8.txt", party, simd_circ);
   compute<int8_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                 mult[0]);
 }
 void multI16(int16_t *input1, int16_t *input2, int16_t *output, int n) {
   if (!mult[1])
     mult[1] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/mult16.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "mult16.txt", party, simd_circ);
   compute<int16_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  mult[1]);
 }
@@ -1051,7 +1097,7 @@ void multI16(int16_t *input1, int16_t *input2, int16_t *output, int n) {
 void multI32(int32_t *input1, int32_t *input2, int32_t *output, int n) {
   if (!mult[2])
     mult[2] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/mult32.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "mult32.txt", party, simd_circ);
   compute<int32_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  mult[2]);
   if (simd_circ->depth == prev_depth) {
@@ -1062,7 +1108,7 @@ void multI32(int32_t *input1, int32_t *input2, int32_t *output, int n) {
 void multI64(int64_t *input1, int64_t *input2, int64_t *output, int n) {
   if (!mult[3])
     mult[3] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/mult64.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "mult64.txt", party, simd_circ);
   compute<int64_t, Circuit<SIMDCircExec<NetIO>>>(input1, input2, output, n,
                                                  mult[3]);
 }
@@ -1080,7 +1126,7 @@ __attribute__((always_inline)) void computeIcmp(T *input1, T *input2,
   case cmp::EQ:
   case cmp::NE:
     if (eq[(int)log2(sizeof(T))] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/icmpeq";
+      string name = MPC_CIRCUIT_DIR "icmpeq";
       name += std::to_string(sizeof(T) * 8) + ".txt";
       eq[(int)log2(sizeof(T))] =
           new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -1088,7 +1134,7 @@ __attribute__((always_inline)) void computeIcmp(T *input1, T *input2,
     break;
   case cmp::GT:
     if (gt[(int)log2(sizeof(T))] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/gt";
+      string name = MPC_CIRCUIT_DIR "gt";
       name += std::to_string(sizeof(T) * 8) + ".txt";
       gt[(int)log2(sizeof(T))] =
           new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -1096,7 +1142,7 @@ __attribute__((always_inline)) void computeIcmp(T *input1, T *input2,
     break;
   case cmp::GE:
     if (ge[(int)log2(sizeof(T))] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/ge";
+      string name = MPC_CIRCUIT_DIR "ge";
       name += std::to_string(sizeof(T) * 8) + ".txt";
       ge[(int)log2(sizeof(T))] =
           new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
@@ -1224,7 +1270,7 @@ int8_t addI8(int8_t input1, int8_t input2) {
   int8_t output;
   if (!adder[0])
     adder[0] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adder8.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adder8.txt", party, simd_circ);
   compute<int8_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                 adder[0]);
   return output;
@@ -1234,7 +1280,7 @@ int16_t addI16(int16_t input1, int16_t input2) {
   int16_t output;
   if (!adder[1])
     adder[1] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adder16.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adder16.txt", party, simd_circ);
   compute<int16_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  adder[1]);
   return output;
@@ -1244,7 +1290,7 @@ int32_t addI32(int32_t input1, int32_t input2) {
   int32_t output;
   if (!adder[2])
     adder[2] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adder32.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adder32.txt", party, simd_circ);
   compute<int32_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  adder[2]);
   return output;
@@ -1253,7 +1299,7 @@ int64_t addI64(int64_t input1, int64_t input2) {
   int64_t output;
   if (!adder[3])
     adder[3] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adder64.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adder64.txt", party, simd_circ);
   compute<int64_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  adder[3]);
   return output;
@@ -1263,7 +1309,7 @@ int8_t subI8(int8_t input1, int8_t input2) {
   int8_t output;
   if (!sub[0])
     sub[0] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/sub8.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "sub8.txt", party, simd_circ);
   compute<int8_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                 sub[0]);
   return output;
@@ -1273,7 +1319,7 @@ int16_t subI16(int16_t input1, int16_t input2) {
   int16_t output;
   if (!sub[1])
     sub[1] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/sub16.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "sub16.txt", party, simd_circ);
   compute<int16_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  sub[1]);
   return output;
@@ -1283,7 +1329,7 @@ int32_t subI32(int32_t input1, int32_t input2) {
   int32_t output;
   if (!sub[2])
     sub[2] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/sub32.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "sub32.txt", party, simd_circ);
   compute<int32_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  sub[2]);
   return output;
@@ -1292,7 +1338,7 @@ int64_t subI64(int64_t input1, int64_t input2) {
   int64_t output;
   if (!sub[3])
     sub[3] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/sub64.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "sub64.txt", party, simd_circ);
   compute<int64_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  sub[3]);
   return output;
@@ -1302,7 +1348,7 @@ int8_t multI8(int8_t input1, int8_t input2) {
   int8_t output;
   if (!mult[0])
     mult[0] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/mult8.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "mult8.txt", party, simd_circ);
   compute<int8_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                 mult[0]);
   return output;
@@ -1312,7 +1358,7 @@ int16_t multI16(int16_t input1, int16_t input2) {
   int16_t output;
   if (!mult[1])
     mult[1] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/mult16.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "mult16.txt", party, simd_circ);
   compute<int16_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  mult[1]);
   return output;
@@ -1322,7 +1368,7 @@ int32_t multI32(int32_t input1, int32_t input2) {
   int32_t output;
   if (!mult[2])
     mult[2] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/mult32.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "mult32.txt", party, simd_circ);
   compute<int32_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  mult[2]);
   return output;
@@ -1331,7 +1377,7 @@ int64_t multI64(int64_t input1, int64_t input2) {
   int64_t output;
   if (!mult[3])
     mult[3] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/mult64.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "mult64.txt", party, simd_circ);
   compute<int64_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  mult[3]);
   return output;
@@ -1341,7 +1387,7 @@ int8_t divI8(int8_t input1, int8_t input2) {
   int8_t output;
   if (!div[0])
     div[0] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/div8.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "div8.txt", party, simd_circ);
   compute<int8_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                 div[0]);
   return output;
@@ -1351,7 +1397,7 @@ int16_t divI16(int16_t input1, int16_t input2) {
   int16_t output;
   if (!div[1])
     div[1] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/div16.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "div16.txt", party, simd_circ);
   compute<int16_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  div[1]);
   return output;
@@ -1361,7 +1407,7 @@ int32_t divI32(int32_t input1, int32_t input2) {
   int32_t output;
   if (!div[2])
     div[2] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/div32.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "div32.txt", party, simd_circ);
   compute<int32_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  div[2]);
   return output;
@@ -1370,7 +1416,7 @@ int64_t divI64(int64_t input1, int64_t input2) {
   int64_t output;
   if (!div[3])
     div[3] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/div64.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "div64.txt", party, simd_circ);
   compute<int64_t, Circuit<SIMDCircExec<NetIO>>>(&input1, &input2, &output, 1,
                                                  div[3]);
   return output;
@@ -1403,7 +1449,7 @@ void divF(float *input1, float *input2, float *output, int n) {
   uint32_t *o = reinterpret_cast<uint32_t *>(output);
   if (!div[4])
     div[4] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/divf.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "divf.txt", party, simd_circ);
   compute<uint32_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, n, div[4]);
 }
 void addF(float *input1, float *input2, float *output, int n) {
@@ -1413,7 +1459,7 @@ void addF(float *input1, float *input2, float *output, int n) {
   uint32_t *o = reinterpret_cast<uint32_t *>(output);
   if (!adder[4])
     adder[4] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adderf.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adderf.txt", party, simd_circ);
   compute<uint32_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, n, adder[4]);
 }
 void subF(float *input1, float *input2, float *output, int n) {
@@ -1423,7 +1469,7 @@ void subF(float *input1, float *input2, float *output, int n) {
   uint32_t *o = reinterpret_cast<uint32_t *>(output);
   if (!sub[4])
     sub[4] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/subf.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "subf.txt", party, simd_circ);
   compute<uint32_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, n, sub[4]);
 }
 void multF(float *input1, float *input2, float *output, int n) {
@@ -1433,7 +1479,7 @@ void multF(float *input1, float *input2, float *output, int n) {
   uint32_t *o = reinterpret_cast<uint32_t *>(output);
   if (!mult[4])
     mult[4] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/multf.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "multf.txt", party, simd_circ);
   compute<uint32_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, n, mult[4]);
 }
 void fcmpEq(float *input1, float *input2, bool *output, int n, int op) {
@@ -1454,21 +1500,21 @@ void fcmpEq(float *input1, float *input2, bool *output, int n, int op) {
   case cmp::EQ:
   case cmp::NE:
     if (eq[4] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/icmpeqf.txt";
+      string name = MPC_CIRCUIT_DIR "icmpeqf.txt";
       eq[4] = new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
     }
     circ = eq[4];
     break;
   case cmp::GT:
     if (gt[4] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/gtf.txt";
+      string name = MPC_CIRCUIT_DIR "gtf.txt";
       gt[4] = new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
     }
     circ = gt[4];
     break;
   case cmp::GE:
     if (ge[4] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/gef.txt";
+      string name = MPC_CIRCUIT_DIR "gef.txt";
       ge[4] = new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
     }
     circ = ge[4];
@@ -1491,7 +1537,7 @@ float addF(float input1, float input2) {
   uint32_t *o = reinterpret_cast<uint32_t *>(&output);
   if (!adder[4])
     adder[4] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adderf.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adderf.txt", party, simd_circ);
   compute<uint32_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, 1, adder[4]);
   return output;
 }
@@ -1502,7 +1548,7 @@ float subF(float input1, float input2) {
   uint32_t *o = reinterpret_cast<uint32_t *>(&output);
   if (!sub[4])
     sub[4] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/subf.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "subf.txt", party, simd_circ);
   compute<uint32_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, 1, sub[4]);
   return output;
 }
@@ -1513,7 +1559,7 @@ float multF(float input1, float input2) {
   uint32_t *o = reinterpret_cast<uint32_t *>(&output);
   if (!mult[4])
     mult[4] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/multf.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "multf.txt", party, simd_circ);
   compute<uint32_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, 1, mult[4]);
   return output;
 }
@@ -1524,7 +1570,7 @@ float divF(float input1, float input2) {
   uint32_t *o = reinterpret_cast<uint32_t *>(&output);
   if (!div[4])
     div[4] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/divf.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "divf.txt", party, simd_circ);
   compute<uint32_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, 1, div[4]);
   return output;
 }
@@ -1561,7 +1607,7 @@ void divF(double *input1, double *input2, double *output, int n) {
   uint64_t *o = reinterpret_cast<uint64_t *>(output);
   if (!div[5])
     div[5] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/divd.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "divd.txt", party, simd_circ);
   compute<uint64_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, n, div[5]);
 }
 void addF(double *input1, double *input2, double *output, int n) {
@@ -1571,7 +1617,7 @@ void addF(double *input1, double *input2, double *output, int n) {
   uint64_t *o = reinterpret_cast<uint64_t *>(output);
   if (!adder[5])
     adder[5] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adderd.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adderd.txt", party, simd_circ);
   compute<uint64_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, n, adder[5]);
 }
 void subF(double *input1, double *input2, double *output, int n) {
@@ -1581,7 +1627,7 @@ void subF(double *input1, double *input2, double *output, int n) {
   uint64_t *o = reinterpret_cast<uint64_t *>(output);
   if (!sub[5])
     sub[5] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/subd.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "subd.txt", party, simd_circ);
   compute<uint64_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, n, sub[5]);
 }
 void multF(double *input1, double *input2, double *output, int n) {
@@ -1591,7 +1637,7 @@ void multF(double *input1, double *input2, double *output, int n) {
   uint64_t *o = reinterpret_cast<uint64_t *>(output);
   if (!mult[5])
     mult[5] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/multd.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "multd.txt", party, simd_circ);
   compute<uint64_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, n, mult[5]);
 }
 void fcmpEq(double *input1, double *input2, bool *output, int n, int op) {
@@ -1612,21 +1658,21 @@ void fcmpEq(double *input1, double *input2, bool *output, int n, int op) {
   case cmp::EQ:
   case cmp::NE:
     if (eq[5] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/icmpeqd.txt";
+      string name = MPC_CIRCUIT_DIR "icmpeqd.txt";
       eq[5] = new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
     }
     circ = eq[5];
     break;
   case cmp::GT:
     if (gt[5] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/gtd.txt";
+      string name = MPC_CIRCUIT_DIR "gtd.txt";
       gt[5] = new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
     }
     circ = gt[5];
     break;
   case cmp::GE:
     if (ge[5] == nullptr) {
-      string name = "/usr/local/include/mpc/circuits/ged.txt";
+      string name = MPC_CIRCUIT_DIR "ged.txt";
       ge[5] = new Circuit<SIMDCircExec<NetIO>>(name.c_str(), party, simd_circ);
     }
     circ = ge[5];
@@ -1649,7 +1695,7 @@ double addF(double input1, double input2) {
   uint64_t *o = reinterpret_cast<uint64_t *>(&output);
   if (!adder[5])
     adder[5] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/adderd.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "adderd.txt", party, simd_circ);
   compute<uint64_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, 1, adder[5]);
   return output;
 }
@@ -1660,7 +1706,7 @@ double subF(double input1, double input2) {
   uint64_t *o = reinterpret_cast<uint64_t *>(&output);
   if (!sub[5])
     sub[5] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/subd.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "subd.txt", party, simd_circ);
   compute<uint64_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, 1, sub[5]);
   return output;
 }
@@ -1671,7 +1717,7 @@ double multF(double input1, double input2) {
   uint64_t *o = reinterpret_cast<uint64_t *>(&output);
   if (!mult[5])
     mult[5] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/multd.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "multd.txt", party, simd_circ);
   compute<uint64_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, 1, mult[5]);
   return output;
 }
@@ -1682,7 +1728,7 @@ double divF(double input1, double input2) {
   uint64_t *o = reinterpret_cast<uint64_t *>(&output);
   if (!div[5])
     div[5] = new Circuit<SIMDCircExec<NetIO>>(
-        "/usr/local/include/mpc/circuits/divd.txt", party, simd_circ);
+        MPC_CIRCUIT_DIR "divd.txt", party, simd_circ);
   compute<uint64_t, Circuit<SIMDCircExec<NetIO>>>(i1, i2, o, 1, div[5]);
   return output;
 }
