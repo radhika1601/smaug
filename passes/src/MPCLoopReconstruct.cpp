@@ -1,10 +1,73 @@
 #include "MPCLoopReconstruct.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <map>
 
 #define DEBUG_TYPE "mpc-loop-reconstruct"
 #include "MPCVecUtils.h"
+
+// The buffers the instructions of L write to. Unknown is set when L writes
+// memory that cannot be named, e.g. through a call.
+struct LoopWrites {
+  SmallPtrSet<const Value *, 8> Objects;
+  bool Unknown = false;
+};
+
+static LoopWrites loopWrites(Loop *L) {
+  LoopWrites W;
+  for (BasicBlock *BB : L->blocks())
+    for (Instruction &I : *BB) {
+      if (!I.mayWriteToMemory())
+        continue;
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        W.Objects.insert(getUnderlyingObject(SI->getPointerOperand()));
+      else if (auto *MI = dyn_cast<MemIntrinsic>(&I))
+        W.Objects.insert(getUnderlyingObject(MI->getRawDest()));
+      else
+        W.Unknown = true;
+    }
+  return W;
+}
+
+// The instructions of L that V is computed from, operands before users, when
+// V depends on the loop only through the outer index: it uses no phi of L,
+// no instruction with side effects, and, when W is given, no load from a
+// buffer that L writes. The leaves are `outer` and values defined outside L.
+// Buffers are told apart by their underlying objects, as in the rest of the
+// pipeline, where distinct arguments and allocations do not alias.
+static bool collectInitChain(Value *V, Loop *L, Value *outer,
+                             SmallVectorImpl<Instruction *> &chain,
+                             SmallPtrSetImpl<Instruction *> &seen,
+                             const LoopWrites *W = nullptr) {
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || V == outer || !L->contains(I) || seen.contains(I))
+    return true;
+  if (isa<PHINode>(I) || I->mayHaveSideEffects() || I->isTerminator())
+    return false;
+  if (auto *LI = dyn_cast<LoadInst>(I))
+    if (W && (W->Unknown || W->Objects.contains(getUnderlyingObject(
+                                LI->getPointerOperand()))))
+      return false;
+  seen.insert(I);
+  for (Value *Op : I->operands())
+    if (!collectInitChain(Op, L, outer, chain, seen, W))
+      return false;
+  chain.push_back(I);
+  return true;
+}
+
+// Whether init is phi's own buffer at the outer index, which is used in
+// place rather than read before the loop.
+static bool isOwnBufferLoad(Value *init, Value *storePtr, Value *outer) {
+  auto *LI = dyn_cast<LoadInst>(init);
+  auto *GEP = LI ? dyn_cast<GetElementPtrInst>(LI->getPointerOperand()) : nullptr;
+  return GEP && storePtr && GEP->getPointerOperand() == storePtr &&
+         GEP->getNumIndices() == 1 && GEP->getOperand(1) == outer &&
+         GEP->getSourceElementType() == LI->getType();
+}
 
 bool MPCLoopReconstructPass::processLoop(Loop *L) {
   MPCVecUtils utils = MPCVecUtils();
@@ -144,10 +207,10 @@ bool MPCLoopReconstructPass::processLoop(Loop *L) {
             inner = true;
 
           if (inner) {
-            innerPhis.insert(std::make_pair<PHINode *, Value *>(
-                &phi, icmp->getPredicate() == ICmpInst::ICMP_NE
-                          ? selInst->getFalseValue()
-                          : selInst->getTrueValue()));
+            Value *init = icmp->getPredicate() == ICmpInst::ICMP_NE
+                              ? selInst->getFalseValue()
+                              : selInst->getTrueValue();
+            innerPhis.insert(std::make_pair(&phi, init));
           } else {
             outerPhis.insert(std::make_pair<PHINode *, Value *>(
                 &phi, icmp->getPredicate() == ICmpInst::ICMP_NE
@@ -191,6 +254,26 @@ bool MPCLoopReconstructPass::processLoop(Loop *L) {
   //     errs() << *(innerPhiStorePtrs[innerPHI.first]);
   //   errs() << "\n";
   // }
+
+  // The initial values are computed before the loop, one per outer index,
+  // so they may depend on the loop only through it, and may not read a
+  // buffer the loop writes: that read would see the buffer before the
+  // loop's writes. Checked before anything is changed.
+  LoopWrites writes = loopWrites(L);
+  for (auto &[phi, init] : innerPhis) {
+    auto it = innerPhiStorePtrs.find(phi);
+    Value *storePtr = it == innerPhiStorePtrs.end() ? nullptr : it->second;
+    if (isOwnBufferLoad(init, storePtr, udiv))
+      continue;
+    SmallVector<Instruction *> chain;
+    SmallPtrSet<Instruction *, 8> seen;
+    if (!collectInitChain(init, L, udiv, chain, seen, &writes)) {
+      LLVM_DEBUG(dbgs() << *init
+                        << " initial value depends on more than the outer "
+                           "index, or reads a buffer the loop writes\n");
+      return false;
+    }
+  }
 
   if (outerPhis.size() > 0) {
     #ifndef NDEBUG
@@ -298,13 +381,24 @@ bool MPCLoopReconstructPass::processLoop(Loop *L) {
         type = Builder.getInt8Ty();
       }
 
-      if (LoadInst *load = dyn_cast<LoadInst>(innerPhi.second)) {
-        GetElementPtrInst *gep =
-            dyn_cast<GetElementPtrInst>(load->getPointerOperand());
-        // If the initial value is load(anyBuffer[induction]), the buffer is
-        // already correctly initialized (by vec-help or a previous pass).
-        // Use the existing load directly and skip buffer initialization.
-        if (gep && gep->getOperand(1) == induction) {
+      MDNode *secret = originalPhi->getMetadata("secret_shared");
+      Value *storePtr = innerPhiStorePtrs[originalPhi];
+      // Set when the phi's buffer is initialized element by element before
+      // the loop, so the fill below is not needed.
+      bool initialized = false;
+      auto *initInst = dyn_cast<Instruction>(innerPhi.second);
+      if (initInst && L->contains(initInst)) {
+        // The initial value depends on the outer index, which is now
+        // `induction`.
+        LoadInst *load = dyn_cast<LoadInst>(initInst);
+        auto *gep = load ? dyn_cast<GetElementPtrInst>(load->getPointerOperand())
+                         : nullptr;
+        bool plainLoad = gep && gep->getNumIndices() == 1 &&
+                         gep->getOperand(1) == induction &&
+                         gep->getSourceElementType() == load->getType();
+        // The initial value is the phi's own buffer at [induction], so the
+        // buffer already holds the running value. Use the load directly.
+        if (isOwnBufferLoad(initInst, storePtr, induction)) {
           auto user =
               dyn_cast<Instruction>(originalPhi->getUniqueUndroppableUser());
           user->replaceAllUsesWith(load);
@@ -312,12 +406,77 @@ bool MPCLoopReconstructPass::processLoop(Loop *L) {
           originalPhi->eraseFromParent();
           continue;
         }
+        if (plainLoad && load->getType() == type) {
+          // The initial values come from another buffer with the same
+          // indexing and type: copy it.
+          Builder.SetInsertPoint(preheader->getTerminator());
+          const DataLayout &DL =
+              header->getParent()->getParent()->getDataLayout();
+          Value *count =
+              Builder.CreateZExtOrTrunc(outerCount, Builder.getInt64Ty());
+          CallInst *copy = Builder.CreateMemCpy(
+              storePtr, DL.getABITypeAlign(type), gep->getPointerOperand(),
+              DL.getABITypeAlign(type),
+              Builder.CreateMul(count,
+                                Builder.getInt64(DL.getTypeAllocSize(type))));
+          if (secret)
+            copy->setMetadata("secret_shared", secret);
+        } else {
+          // Compute each initial value in a loop over the outer index before
+          // the reconstructed loop: the instructions it is computed from are
+          // cloned with `induction` replaced by the counter, and the result,
+          // widened for a bool phi, is stored to the phi's buffer.
+          SmallVector<Instruction *> chain;
+          SmallPtrSet<Instruction *, 8> seen;
+          collectInitChain(initInst, L, induction, chain, seen);
+          BasicBlock *initEnd =
+              SplitBlock(preheader, preheader->getTerminator());
+          BasicBlock *initLoop = BasicBlock::Create(
+              header->getContext(), "reconInit", header->getParent(), initEnd);
+          preheader->getTerminator()->eraseFromParent();
+          Builder.SetInsertPoint(preheader);
+          Value *count =
+              Builder.CreateZExtOrTrunc(outerCount, Builder.getInt64Ty());
+          Builder.CreateCondBr(Builder.CreateICmpSGT(count, Builder.getInt64(0)),
+                               initLoop, initEnd);
+          Builder.SetInsertPoint(initLoop);
+          PHINode *k = Builder.CreatePHI(Builder.getInt64Ty(), 2);
+          k->addIncoming(Builder.getInt64(0), preheader);
+          DenseMap<Value *, Value *> map;
+          map[induction] = Builder.CreateZExtOrTrunc(k, induction->getType());
+          for (Instruction *I : chain) {
+            Instruction *C = I->clone();
+            for (Use &U : C->operands())
+              if (Value *M = map.lookup(U.get()))
+                U.set(M);
+            Builder.Insert(C);
+            map[I] = C;
+          }
+          Value *wide = Builder.CreateZExtOrTrunc(map[initInst], type);
+          StoreInst *st =
+              Builder.CreateStore(wide, Builder.CreateGEP(type, storePtr, k));
+          if (secret) {
+            if (auto *W = dyn_cast<Instruction>(wide); W && W != map[initInst])
+              W->setMetadata("secret_shared", secret);
+            st->setMetadata("secret_shared", secret);
+          }
+          Value *next = Builder.CreateAdd(k, Builder.getInt64(1));
+          k->addIncoming(next, initLoop);
+          Builder.CreateCondBr(Builder.CreateICmpSLT(next, count), initLoop,
+                               initEnd);
+          // Later code inserts before the loop at the end of the preheader.
+          preheader = initEnd;
+        }
+        initialized = true;
       }
 
       Builder.SetInsertPoint(header->getFirstNonPHI());
       auto gep =
           Builder.CreateGEP(type, innerPhiStorePtrs[originalPhi], induction);
-      Value *val = Builder.CreateLoad(type, gep);
+      LoadInst *bufLoad = Builder.CreateLoad(type, gep);
+      if (initialized && secret)
+        bufLoad->setMetadata("secret_shared", secret);
+      Value *val = bufLoad;
       if (newStorePtrs.find(innerPhiStorePtrs[originalPhi]) !=
           newStorePtrs.end()) {
         Builder.SetInsertPoint(header->getTerminator());
@@ -329,6 +488,10 @@ bool MPCLoopReconstructPass::processLoop(Loop *L) {
           dyn_cast<Instruction>(originalPhi->getUniqueUndroppableUser());
       user->replaceAllUsesWith(val);
       user->eraseFromParent();
+      if (initialized) {
+        originalPhi->eraseFromParent();
+        continue;
+      }
       Builder.SetInsertPoint(preheader->getTerminator());
       llvm::Function *storeFunc = cast<llvm::Function>(
           header->getParent()

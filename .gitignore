@@ -7,6 +7,7 @@ benchmarks/build/
 # Compiled outputs
 *.o
 *.so
+*.dylib
 *.a
 *_mpc
 
@@ -25,3 +26,13 @@ benchmarks/data/
 
 # OS
 .DS_Store
+
+# Local dependency prefix (see docs/install.md)
+.deps/
+
+# Editor language-server index
+.cache/
+
+# Correctness test build outputs
+tests/build/
+tests/__pycache__/

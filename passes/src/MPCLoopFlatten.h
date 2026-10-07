@@ -589,12 +589,30 @@ public:
         }
       }
     }
+    // A new value defined inside the blocks is not available on edges that
+    // enter them.
+    auto *newInst = dyn_cast_or_null<Instruction>(newVal);
+    bool newInside = newInst && blocks.contains(newInst->getParent());
     for (Instruction *userInst : toUpdate) {
       bool removed = false;
       if (PHINode *phi = dyn_cast<PHINode>(userInst)) {
         if (phi->getNumIncomingValues() == 1) {
           phi->replaceAllUsesWith(newVal);
           phi->eraseFromParent();
+          removed = true;
+        } else {
+          // A header phi's value on entry. The phi is only read through
+          // select(inner.eq.0, init, phi), which supplies the initial value
+          // on the first inner iteration, so the entry value is never used.
+          // Give it a constant that is available before the loop.
+          for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+            if (phi->getIncomingValue(i) != oldVal)
+              continue;
+            if (newInside && !blocks.contains(phi->getIncomingBlock(i)))
+              phi->setIncomingValue(i, Constant::getNullValue(phi->getType()));
+            else
+              phi->setIncomingValue(i, newVal);
+          }
           removed = true;
         }
       }

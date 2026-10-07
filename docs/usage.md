@@ -69,15 +69,18 @@ Create a JSON file describing which function arguments are secret-shared:
 ### 3. Compile
 
 ```bash
+# LLVM 18 location: /usr/lib/llvm-18 on Ubuntu, $(brew --prefix llvm@18) on macOS
+LLVM_PREFIX=/usr/lib/llvm-18
+
 # Compile to LLVM IR
-clang++ -I/usr/local/include -O0 -Xclang -disable-O0-optnone \
+$LLVM_PREFIX/bin/clang++ -I/usr/local/include -O0 -Xclang -disable-O0-optnone \
     -S -emit-llvm -std=c++17 my_program.cpp -o my_program.ll
 
 # Strip target triple (required for scalable vector support)
-python3 test/remove_target_triple.py my_program.ll
+python3 passes/remove_target_triple.py my_program.ll
 
 # Run Smaug transformation pipeline
-opt --interleave-loops=false \
+$LLVM_PREFIX/bin/opt --interleave-loops=false \
     -load-pass-plugin=passes/build/libpasses.so \
     -passes=smaug-pipeline \
     --metadata-path=my_program.ll.json \
@@ -85,9 +88,12 @@ opt --interleave-loops=false \
     my_program.ll -o my_program.ll -S
 
 # Link against MPC runtime
-clang++ -L/usr/local/lib -lssl -lcrypto -lemp-tool -maes -mssse3 \
+$LLVM_PREFIX/bin/clang++ -L/usr/local/lib -Wl,-rpath,/usr/local/lib \
+    -lssl -lcrypto -lemp-tool -maes -mssse3 \
     -lgc-opt my_program.ll -std=c++17 -o my_program_mpc
 ```
+
+On macOS with Apple silicon, drop `-maes -mssse3`, and add `-isysroot $(xcrun --show-sdk-path)` and `-L$(brew --prefix openssl@3)/lib` to both `clang++` commands. Also pass `-isysroot` to the first one.
 
 ### 4. Run
 
