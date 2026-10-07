@@ -200,25 +200,32 @@ bool MemoryAlign::processLoop(Loop *L) {
   // since L->getLoopPreheader() changes after the new storesLoop is inserted.
   BasicBlock *origPH = L->getLoopPreheader();
 
+  // If origPH is an outer loop header (e.g., reconHeader), hoist the malloc
+  // to the outer loop's preheader to avoid repeated MPC allocations per
+  // iteration, and free after the outer loop. Both blocks are found before
+  // createNewLoop: LoopInfo does not know the new storesLoop blocks, so
+  // afterwards the outer loop appears to exit into them. The malloc is only
+  // hoisted when the free can follow it out of the outer loop.
+  BasicBlock *outerPH = nullptr;
+  BasicBlock *freeInsertBB = L->getExitBlock();
+  {
+    Loop *outerLoop = LI->getLoopFor(origPH);
+    if (outerLoop && outerLoop->getHeader() == origPH) {
+      BasicBlock *PH = outerLoop->getLoopPreheader();
+      BasicBlock *outerExit = outerLoop->getExitBlock();
+      if (PH && outerExit) {
+        outerPH = PH;
+        freeInsertBB = outerExit;
+      }
+    }
+  }
+
   auto p = createNewLoop(Builder, L, L->getHeader(), origPH,
                          loopCount, L->getName());
   BasicBlock *storePH = p.first;
   BasicBlock *storeLoop = p.second;
   std::map<Instruction *, Instruction *> loadMallocMap;
-
-  // If origPH is an outer loop header (e.g., reconHeader), hoist the malloc
-  // to the outer loop's preheader to avoid repeated MPC allocations per iteration.
-  BasicBlock *mallocInsertBB = storePH;
-  BasicBlock *freeInsertBB = L->getExitBlock();
-  {
-    Loop *outerLoop = LI->getLoopFor(origPH);
-    if (outerLoop && outerLoop->getHeader() == origPH) {
-      if (BasicBlock *outerPH = outerLoop->getLoopPreheader())
-        mallocInsertBB = outerPH;
-      if (BasicBlock *outerExit = outerLoop->getExitBlock())
-        freeInsertBB = outerExit;
-    }
-  }
+  BasicBlock *mallocInsertBB = outerPH ? outerPH : storePH;
 
   Builder.SetInsertPoint(mallocInsertBB->getFirstInsertionPt());
   for (auto I : loadInsts) {

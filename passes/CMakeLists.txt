@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.22)
 
-set(LLVM_18_PREFIX "/usr/lib/llvm-18" CACHE PATH "Path to the LLVM 18 install")
+if(APPLE)
+    # CMAKE_HOST_SYSTEM_PROCESSOR is not set before project(), so test the prefix.
+    if(EXISTS "/opt/homebrew/opt/llvm@18")
+        set(LLVM_18_DEFAULT_PREFIX "/opt/homebrew/opt/llvm@18")
+    else()
+        set(LLVM_18_DEFAULT_PREFIX "/usr/local/opt/llvm@18")
+    endif()
+else()
+    set(LLVM_18_DEFAULT_PREFIX "/usr/lib/llvm-18")
+endif()
+set(LLVM_18_PREFIX "${LLVM_18_DEFAULT_PREFIX}" CACHE PATH "Path to the LLVM 18 install")
 
 # The compiler must be selected before project() to affect the initial CMake
 # configure. If the cache already contains a compiler, the user must reconfigure
@@ -59,6 +69,8 @@ link_directories(${LLVM_LIBRARY_DIRS})
 include_directories(./include)
 include_directories(./include/Vectorize)
 include_directories(./src)
+# The runtime ABI list (mpc/smaug_abi.def) is shared with the runtime.
+include_directories(../runtime)
 
 add_library(passes MODULE
     ./src/MPCHierarchical.cpp
@@ -67,6 +79,13 @@ add_library(passes MODULE
     ./src/MetadataHelper.cpp
     ./src/Passes.cpp
     ./src/MPCLink.cpp
+    ./src/Options.cpp
+    ./src/lower/Abi.cpp
+    ./src/lower/Lowering.cpp
+    ./src/lower/MPCLower.cpp
+    ./src/lower/SecretAnalysis.cpp
+    ./src/lower/SecretSpec.cpp
+    ./src/lower/VectorLoops.cpp
     ./src/MPCLoopFlatten.cpp
     ./src/MPCLoopMemAlign.cpp
     ./src/MPCLoopReconstruct.cpp
@@ -86,7 +105,12 @@ add_library(passes MODULE
 )
 
 target_compile_options(passes PRIVATE -fno-exceptions -fno-rtti -g)
-target_link_options(passes PRIVATE "-Wl,-Bsymbolic-functions")
+if(APPLE)
+    # LLVM symbols are resolved from the host opt at load time.
+    target_link_options(passes PRIVATE "-Wl,-undefined,dynamic_lookup")
+else()
+    target_link_options(passes PRIVATE "-Wl,-Bsymbolic-functions")
+endif()
 
 message(STATUS "CMAKE_C_FLAGS: ${CMAKE_C_FLAGS}")
 message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
