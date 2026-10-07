@@ -87,7 +87,7 @@ namespace MPC
 
     if (elementSize == 1)
     {
-      Bit a = new Bit(((bool *)element)[0], PUBLIC);
+      Bit a(((bool *)element)[0], PUBLIC);
       for (int i = 0; i < n; ++i)
         ((Bit *)arr)[i] = a;
     }
@@ -115,8 +115,7 @@ namespace MPC
   __attribute__((always_inline)) void updateType(void *a, void *b, int n, int elementSize1, int elementSize2)
   {
     // auto start = clock_start();
-    for (int i = 0; i < n; ++i)
-      if (log2(elementSize1) == 0)
+    if (log2(elementSize1) == 0)
       {
         for (int i = 0; i < n; ++i)
           if (log2(elementSize2) == 0)
@@ -136,7 +135,12 @@ namespace MPC
         for (int i = 0; i < n; ++i)
         {
           if (log2(elementSize2) == 0)
-            ((Integer *)a)[i].bits.resize(elementSize1 * 8, ((Bit *)b)[i]);
+          {
+            // Zero-extend the Bit: bit 0 is b, the rest are public zeros.
+            std::vector<Bit> bits(elementSize1 * 8, Bit(false, PUBLIC));
+            bits[0] = ((Bit *)b)[i];
+            ((Integer *)a)[i] = Integer(bits);
+          }
           else
           {
             if (elementSize1 > elementSize2)
@@ -227,6 +231,25 @@ namespace MPC
     vector<Bit> bits(size, b[0]);
     Integer *i = new Integer[1];
     i[0] = Integer(bits);
+    return i;
+  }
+
+  // Zero-extends a Bit: bit 0 is b, the remaining bits are public zeros.
+  __attribute__((always_inline)) Integer *bitToIntZext(Bit *b, int size)
+  {
+    vector<Bit> bits(size, Bit(false, PUBLIC));
+    bits[0] = b[0];
+    Integer *i = new Integer[1];
+    i[0] = Integer(bits);
+    return i;
+  }
+
+  // Widens an Integer to size bits, with sign or zero extension.
+  __attribute__((always_inline)) Integer *extInt(Integer *x, int size, bool sign)
+  {
+    Integer *i = new Integer[1];
+    i[0] = x[0];
+    i[0].resize(size, sign);
     return i;
   }
 
@@ -325,18 +348,20 @@ namespace MPC
     return ints[0];
   }
 
-  __attribute__((always_inline)) void writeArg(Integer *vals, void *arg, int n, int elementSize)
+  // Writes XOR shares of vals back to the caller's array. elementBits is the
+  // element width in bits, as VectorMPCLink passes it.
+  __attribute__((always_inline)) void writeArg(Integer *vals, void *arg, int n, int elementBits)
   {
     for (int i = 0; i < n; ++i)
     {
-      if (log2(elementSize) == 0)
-        ((int8_t *)arg)[0] = vals[i].reveal<int32_t>(XOR);
-      else if (log2(elementSize) == 1)
-        ((int16_t *)arg)[0] = vals[i].reveal<int32_t>(XOR);
-      else if (log2(elementSize) == 2)
-        ((int32_t *)arg)[0] = vals[i].reveal<int32_t>(XOR);
-      else if (log2(elementSize) == 3)
-        ((int64_t *)arg)[0] = vals[i].reveal<int64_t>(XOR);
+      if (elementBits == 8)
+        ((int8_t *)arg)[i] = vals[i].reveal<int32_t>(XOR);
+      else if (elementBits == 16)
+        ((int16_t *)arg)[i] = vals[i].reveal<int32_t>(XOR);
+      else if (elementBits == 32)
+        ((int32_t *)arg)[i] = vals[i].reveal<int32_t>(XOR);
+      else if (elementBits == 64)
+        ((int64_t *)arg)[i] = vals[i].reveal<int64_t>(XOR);
     }
   }
 

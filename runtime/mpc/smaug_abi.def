@@ -1,0 +1,97 @@
+// The runtime ABI used by the mpc-lower pass, as an X-macro list.
+//
+//   SMAUG_FN(return type, name, C parameter list, LLVM signature)
+//
+// The LLVM signature lists the return type, then the parameter types:
+// v = void, i = i32, l = i64, p = ptr. The pass builds its declarations from
+// it, and smaug_abi.h builds the C declarations from the other fields.
+//
+// Conventions:
+// - w is the element width in bits: 1, 8, 16, 32 or 64. Float functions take
+//   w = 32.
+// - A secret buffer holds n elements. GMW: XOR shares, one byte per element
+//   for w = 1 and w / 8 bytes otherwise. GC: emp::Bit, emp::Integer or
+//   emp::Float objects. A secret scalar is a one-element secret buffer.
+// - A public operand is a plain array in the same byte layout, read with
+//   pstride 0 (one value for every element) or 1.
+// - pub_is_lhs says whether the public operand is the left operand.
+// - Outputs may alias inputs exactly. n may be 0.
+// - pred is an LLVM CmpInst predicate number (icmp 32..41, fcmp 1..14).
+// - op is a SMAUG_RED_* value from smaug_abi.h.
+
+#ifndef SMAUG_FN
+#error "define SMAUG_FN before including smaug_abi.def"
+#endif
+
+// Buffers.
+SMAUG_FN(void *, smaug_alloc, (uint32_t w, uint64_t n), "p:i,l")
+SMAUG_FN(void, smaug_free, (void *b, uint32_t w, uint64_t n), "v:p,i,l")
+SMAUG_FN(void *, smaug_elem, (void *b, uint32_t w, uint64_t i), "p:p,i,l")
+SMAUG_FN(void, smaug_copy, (uint32_t w, void *dst, const void *src, uint64_t n), "v:i,p,p,l")
+SMAUG_FN(void, smaug_fill, (uint32_t w, void *dst, const void *src1, uint64_t n), "v:i,p,p,l")
+SMAUG_FN(void, smaug_reverse, (uint32_t w, void *dst, const void *src, uint64_t n), "v:i,p,p,l")
+SMAUG_FN(int32_t, smaug_party, (void), "i:")
+
+// Moving values in and out of the protocol.
+SMAUG_FN(void, smaug_import, (uint32_t w, void *dst, const void *share, uint64_t n), "v:i,p,p,l")
+SMAUG_FN(void, smaug_export, (uint32_t w, void *share, const void *src, uint64_t n), "v:i,p,p,l")
+SMAUG_FN(void, smaug_share_public, (uint32_t w, void *dst, const void *pub, uint64_t pstride, uint64_t n), "v:i,p,p,l,l")
+SMAUG_FN(void, smaug_reveal, (uint32_t w, void *pub, const void *src, uint64_t n), "v:i,p,p,l")
+
+// Elementwise integer operations, secret op secret.
+// Names are spelled out because and, or and xor are operator tokens in C++.
+#define SMAUG_BINOP(name, name_sp)                                             \
+  SMAUG_FN(void, name,                                                         \
+           (uint32_t w, void *out, const void *a, const void *b, uint64_t n),  \
+           "v:i,p,p,p,l")                                                      \
+  SMAUG_FN(void, name_sp,                                                      \
+           (uint32_t w, void *out, const void *a, const void *pub,             \
+            uint64_t pstride, uint32_t pub_is_lhs, uint64_t n),                \
+           "v:i,p,p,p,l,i,l")
+SMAUG_BINOP(smaug_add, smaug_add_sp)
+SMAUG_BINOP(smaug_sub, smaug_sub_sp)
+SMAUG_BINOP(smaug_mul, smaug_mul_sp)
+SMAUG_BINOP(smaug_sdiv, smaug_sdiv_sp)
+SMAUG_BINOP(smaug_udiv, smaug_udiv_sp)
+SMAUG_BINOP(smaug_srem, smaug_srem_sp)
+SMAUG_BINOP(smaug_urem, smaug_urem_sp)
+SMAUG_BINOP(smaug_and, smaug_and_sp)
+SMAUG_BINOP(smaug_or, smaug_or_sp)
+SMAUG_BINOP(smaug_xor, smaug_xor_sp)
+SMAUG_BINOP(smaug_shl, smaug_shl_sp)
+SMAUG_BINOP(smaug_lshr, smaug_lshr_sp)
+SMAUG_BINOP(smaug_ashr, smaug_ashr_sp)
+SMAUG_BINOP(smaug_smin, smaug_smin_sp)
+SMAUG_BINOP(smaug_smax, smaug_smax_sp)
+SMAUG_BINOP(smaug_umin, smaug_umin_sp)
+SMAUG_BINOP(smaug_umax, smaug_umax_sp)
+
+// Comparisons. out is a w = 1 buffer.
+SMAUG_FN(void, smaug_icmp, (uint32_t pred, uint32_t w, void *out, const void *a, const void *b, uint64_t n), "v:i,i,p,p,p,l")
+SMAUG_FN(void, smaug_icmp_sp, (uint32_t pred, uint32_t w, void *out, const void *a, const void *pub, uint64_t pstride, uint32_t pub_is_lhs, uint64_t n), "v:i,i,p,p,p,l,i,l")
+
+// out = cond ? t : f. cond is a w = 1 buffer; pcond is public bytes.
+SMAUG_FN(void, smaug_select, (uint32_t w, void *out, const void *cond, const void *t, const void *f, uint64_t n), "v:i,p,p,p,p,l")
+SMAUG_FN(void, smaug_select_pubcond, (uint32_t w, void *out, const void *pcond, uint64_t pstride, const void *t, const void *f, uint64_t n), "v:i,p,p,l,p,p,l")
+
+// Width changes from ws to wd bits.
+SMAUG_FN(void, smaug_zext, (uint32_t wd, uint32_t ws, void *out, const void *a, uint64_t n), "v:i,i,p,p,l")
+SMAUG_FN(void, smaug_sext, (uint32_t wd, uint32_t ws, void *out, const void *a, uint64_t n), "v:i,i,p,p,l")
+SMAUG_FN(void, smaug_trunc, (uint32_t wd, uint32_t ws, void *out, const void *a, uint64_t n), "v:i,i,p,p,l")
+
+// out1 = op over a[0..n). n = 0 gives the identity of op.
+SMAUG_FN(void, smaug_reduce, (uint32_t op, uint32_t w, void *out1, const void *a, uint64_t n), "v:i,i,p,p,l")
+
+// Oblivious access: buf has len elements, idx is a secret scalar of idx_w
+// bits. An out-of-range index reads 0 and writes nothing.
+SMAUG_FN(void, smaug_oload, (uint32_t w, void *out1, const void *buf, uint64_t len, const void *idx, uint32_t idx_w), "v:i,p,p,l,p,i")
+SMAUG_FN(void, smaug_ostore, (uint32_t w, void *buf, uint64_t len, const void *idx, uint32_t idx_w, const void *val1), "v:i,p,l,p,i,p")
+
+// Floating point (w = 32).
+SMAUG_BINOP(smaug_fadd, smaug_fadd_sp)
+SMAUG_BINOP(smaug_fsub, smaug_fsub_sp)
+SMAUG_BINOP(smaug_fmul, smaug_fmul_sp)
+SMAUG_BINOP(smaug_fdiv, smaug_fdiv_sp)
+#undef SMAUG_BINOP
+SMAUG_FN(void, smaug_fcmp, (uint32_t pred, uint32_t w, void *out, const void *a, const void *b, uint64_t n), "v:i,i,p,p,p,l")
+SMAUG_FN(void, smaug_fcmp_sp, (uint32_t pred, uint32_t w, void *out, const void *a, const void *pub, uint64_t pstride, uint32_t pub_is_lhs, uint64_t n), "v:i,i,p,p,p,l,i,l")
