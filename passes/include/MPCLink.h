@@ -7,6 +7,15 @@
 #include <map>
 #include <set>
 
+// int64_t mangles as `long` (l) on Linux and `long long` (x) on macOS.
+#ifndef MPC_I64
+#ifdef __APPLE__
+#define MPC_I64 "x"
+#else
+#define MPC_I64 "l"
+#endif
+#endif
+
 using namespace llvm;
 class CheckSecretShared;
 
@@ -88,14 +97,14 @@ private:
       {"init8", "_ZN3MPC10getIntegerEa"},
       {"init16", "_ZN3MPC10getIntegerEs"},
       {"init32", "_ZN3MPC10getIntegerEi"},
-      {"init64", "_ZN3MPC10getIntegerEl"},
-      {"createInt", "_ZN3MPC9createIntEl"},
-      {"createBit", "_ZN3MPC9createBitEl"},
+      {"init64", "_ZN3MPC10getIntegerE" MPC_I64},
+      {"createInt", "_ZN3MPC9createIntE" MPC_I64},
+      {"createBit", "_ZN3MPC9createBitE" MPC_I64},
       {"loadInt", "_ZN3MPC4loadEPN3emp7IntegerE"},
       {"storeInt", "_ZN3MPC5storeEPN3emp7IntegerERS1_"},
       {"storeBit", "_ZN3MPC5storeEPN3emp3BitERS1_"},
-      {"gepInt", "_ZN3MPC3gepEPN3emp7IntegerEl"},
-      {"gepBit", "_ZN3MPC3gepEPN3emp3BitEl"},
+      {"gepInt", "_ZN3MPC3gepEPN3emp7IntegerE" MPC_I64},
+      {"gepBit", "_ZN3MPC3gepEPN3emp3BitE" MPC_I64},
       {"add8", "_ZN3MPC3addERN3emp7IntegerES2_"},
       {"add16", "_ZN3MPC3addERN3emp7IntegerES2_"},
       {"add32", "_ZN3MPC3addERN3emp7IntegerES2_"},
@@ -127,6 +136,8 @@ private:
       {"sub32", "_ZN3MPC3subERN3emp7IntegerES2_"},
       {"sub64", "_ZN3MPC3subERN3emp7IntegerES2_"},
       {"bittoint", "_ZN3MPC8bitToIntEPN3emp3BitEi"},
+      {"bittointzext", "_ZN3MPC12bitToIntZextEPN3emp3BitEi"},
+      {"extint", "_ZN3MPC6extIntEPN3emp7IntegerEib"},
       {"revealBit", "_ZN3MPC6revealEPN3emp3BitE"},
       {"revealInt", "_ZN3MPC6revealEPN3emp7IntegerE"}
       // {},
@@ -140,28 +151,28 @@ private:
       {"add8", "_ZN3MPC5addI8Eaa"},
       {"add16", "_ZN3MPC6addI16Ess"},
       {"add32", "_ZN3MPC6addI32Eii"},
-      {"add64", "_ZN3MPC6addI64Ell"},
+      {"add64", "_ZN3MPC6addI64E" MPC_I64 MPC_I64},
       {"and1", "_ZN3MPC7andBoolEbb"},
       {"and8", "_ZN3MPC5andI8Eaa"},
       {"and16", "_ZN3MPC6andI16Ess"},
       {"and32", "_ZN3MPC6andI32Eii"},
-      {"and64", "_ZN3MPC6andI64Ell"},
+      {"and64", "_ZN3MPC6andI64E" MPC_I64 MPC_I64},
       {"icmpEq8", "_ZN3MPC8icmpEqI8Eaai"},
       {"icmpEq16", "_ZN3MPC9icmpEqI16Essi"},
       {"icmpEq32", "_ZN3MPC9icmpEqI32Eiii"},
-      {"icmpEq64", "_ZN3MPC9icmpEqI64Elli"},
+      {"icmpEq64", "_ZN3MPC9icmpEqI64E" MPC_I64 MPC_I64 "i"},
       {"mul8", "_ZN3MPC6multI8Eaa"},
       {"mul16", "_ZN3MPC7multI16Ess"},
       {"mul32", "_ZN3MPC7multI32Eii"},
-      {"mul64", "_ZN3MPC7multI64Ell"},
+      {"mul64", "_ZN3MPC7multI64E" MPC_I64 MPC_I64},
       {"div8", "_ZN3MPC5divI8Eaa"},
       {"div16", "_ZN3MPC6divI16Ess"},
       {"div32", "_ZN3MPC6divI32Eii"},
-      {"div64", "_ZN3MPC6divI64Ell"},
+      {"div64", "_ZN3MPC6divI64E" MPC_I64 MPC_I64},
       {"sub8", "_ZN3MPC5subI8Eaa"},
       {"sub16", "_ZN3MPC6subI16Ess"},
       {"sub32", "_ZN3MPC6subI32Eii"},
-      {"sub64", "_ZN3MPC6subI64Ell"},
+      {"sub64", "_ZN3MPC6subI64E" MPC_I64 MPC_I64},
       {"load", "_ZN3MPC4loadEPviS0_iib"},
       {"store", "_ZN3MPC5storeEPvS0_iiib"},
       {"fadd", "_ZN3MPC4addFEff"},
@@ -173,7 +184,7 @@ private:
       {"revI8", "_ZN3MPC6revealIaEET_S1_i"},
       {"revI16", "_ZN3MPC6revealIsEET_S1_i"},
       {"revI32", "_ZN3MPC6revealIiEET_S1_i"},
-      {"revI64", "_ZN3MPC6revealIxEET_S1_i"}};
+      {"revI64", "_ZN3MPC6revealI" MPC_I64 "EET_S1_i"}};
 
   Instruction *createOutput(Instruction *output, Function *F,
                             IRBuilder<> &Builder, Type *type) {

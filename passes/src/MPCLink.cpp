@@ -7,7 +7,7 @@
 
 
 extern cl::opt<std::string> MetadataFilePath;
-extern cl::opt<bool> UseGCMode;
+#include "Options.h"
 
 #define DEBUG_TYPE "mpc-link"
 #include "CheckSecretShared.h"
@@ -222,6 +222,27 @@ bool MPCLinkPass::fcmpCall(Instruction &I, SmallVector<Argument *> &Args) {
   return false;
 }
 
+// Whether an MPC value (gc mode) is a Bit rather than an Integer. i8 booleans
+// live in Bit buffers, so an i8 LLVM value can be backed by either.
+static bool isBitMPC(Value *v, int depth = 0) {
+  if (auto *CI = dyn_cast<CallInst>(v)) {
+    if (Function *Fn = CI->getCalledFunction()) {
+      StringRef n = Fn->getName();
+      return n.contains("3Bit") || n.contains("getBit") ||
+             n.contains("createBit") || n.starts_with("_ZN3MPC4icmp");
+    }
+    return false;
+  }
+  if (auto *PN = dyn_cast<PHINode>(v)) {
+    if (depth > 8)
+      return false;
+    for (Value *in : PN->incoming_values())
+      if (in != PN && isBitMPC(in, depth + 1))
+        return true;
+  }
+  return false;
+}
+
 bool MPCLinkPass::findFunc(Instruction &I, std::string name,
                            SmallVector<Argument *> &Args) {
   Function *F = I.getParent()->getParent();
@@ -262,6 +283,60 @@ bool MPCLinkPass::findFunc(Instruction &I, std::string name,
     if (I.getType() == Type::getInt1Ty(context) && name != "and1") {
       op1 = i1Toi8(op1, Builder, boolTy);
       op2 = i1Toi8(op2, Builder, boolTy);
+    }
+  }
+
+  // gc: an i8 operation on a Bit (an i8 boolean) is a bit operation.
+  if (gc && type == boolTy && (name == "and8" || name == "xor8")) {
+    Value *m1 = ItoMPCI.count(op1) ? ItoMPCI[op1] : nullptr;
+    Value *m2 = ItoMPCI.count(op2) ? ItoMPCI[op2] : nullptr;
+    bool b1 = m1 && isBitMPC(m1), b2 = m2 && isBitMPC(m2);
+    if (b1 || b2) {
+      bool isAnd = name == "and8";
+      Value *bit = b1 ? m1 : m2;
+      Value *other = b1 ? op2 : op1;
+      auto getBit = [&](bool v) {
+        Function *fn = cast<Function>(
+            module
+                ->getOrInsertFunction(
+                    GCFuncNames["init1"],
+                    FunctionType::get(Builder.getPtrTy(), {Builder.getInt1Ty()},
+                                      false))
+                .getCallee());
+        return Builder.CreateCall(fn, {Builder.getInt1(v)});
+      };
+      Value *otherBit = nullptr;
+      if (auto *c = dyn_cast<ConstantInt>(other)) {
+        bool low = c->getValue()[0];
+        // x & 1 == x and x ^ 0 == x for a 0/1 value.
+        if (isAnd ? low : !low) {
+          ItoMPCI.insert(std::make_pair(&I, bit));
+          return true;
+        }
+        if (isAnd) {
+          ItoMPCI.insert(std::make_pair(&I, getBit(false)));
+          return true;
+        }
+        otherBit = getBit(true);
+      } else if (Value *mo = b1 ? m2 : m1; mo && isBitMPC(mo)) {
+        otherBit = mo;
+      } else {
+        errs() << "mpc-link: i8 operation mixes a Bit with a non-Bit: " << I
+               << "\n";
+        return false;
+      }
+      Function *fn = cast<Function>(
+          module
+              ->getOrInsertFunction(
+                  GCFuncNames[isAnd ? "and1" : "xor1"],
+                  FunctionType::get(Builder.getPtrTy(),
+                                    {Builder.getPtrTy(), Builder.getPtrTy()},
+                                    false))
+              .getCallee());
+      auto output = Builder.CreateCall(fn, {bit, otherBit});
+      setSecretShared(output);
+      ItoMPCI.insert(std::make_pair(&I, output));
+      return true;
     }
   }
 
@@ -603,45 +678,66 @@ void MPCLinkPass::replaceFunc(Function &F, SmallVector<Argument *> &Args,
             break;
           LLVM_FALLTHROUGH;
         case Instruction::ZExt:
-          if (gc) {
-            if (I.getType() == Builder.getInt8Ty() &&
-                I.getOperand(0)->getType() == Builder.getInt1Ty()) {
-              if (isa<StoreInst>(I.getUniqueUndroppableUser()) &&
-                  ItoMPCI.find(I.getOperand(0)) != ItoMPCI.end()) {
-                ItoMPCI.insert(std::make_pair(&I, ItoMPCI[I.getOperand(0)]));
-                remove = true;
-                break;
-              }
+        case Instruction::SExt: {
+          bool isSExt = I.getOpcode() == Instruction::SExt;
+          if (gc && ItoMPCI.find(I.getOperand(0)) != ItoMPCI.end()) {
+            Value *src = ItoMPCI[I.getOperand(0)];
+            bool srcIsI1 = I.getOperand(0)->getType() == Builder.getInt1Ty();
+            // An i8 boolean held as a Bit is 0 or 1, so it extends like zext.
+            bool srcIsBit = srcIsI1 || isBitMPC(src);
+            // A bool stored to memory stays a Bit; i8 buffers hold Bits.
+            if (!isSExt && srcIsBit && I.getType() == Builder.getInt8Ty() &&
+                isa_and_nonnull<StoreInst>(I.getUniqueUndroppableUser())) {
+              ItoMPCI.insert(std::make_pair(&I, src));
+              remove = true;
+              break;
             }
+            auto bits =
+                F.getParent()->getDataLayout().getTypeSizeInBits(I.getType());
+            Builder.SetInsertPoint(&I);
+            Value *mpc;
+            if (srcIsBit) {
+              // sext of an i1 copies the bit into every position (0 or -1);
+              // otherwise the bit goes in bit 0 only (0 or 1).
+              Function *func = cast<llvm::Function>(
+                  F.getParent()
+                      ->getOrInsertFunction(
+                          GCFuncNames[isSExt && srcIsI1 ? "bittoint"
+                                                        : "bittointzext"],
+                          FunctionType::get(
+                              Builder.getPtrTy(),
+                              {Builder.getPtrTy(), Builder.getInt32Ty()},
+                              false))
+                      .getCallee());
+              mpc = Builder.CreateCall(func, {src, Builder.getInt32(bits)});
+            } else {
+              Function *func = cast<llvm::Function>(
+                  F.getParent()
+                      ->getOrInsertFunction(
+                          GCFuncNames["extint"],
+                          FunctionType::get(Builder.getPtrTy(),
+                                            {Builder.getPtrTy(),
+                                             Builder.getInt32Ty(),
+                                             Builder.getInt1Ty()},
+                                            false))
+                      .getCallee());
+              mpc = Builder.CreateCall(func, {src, Builder.getInt32(bits),
+                                              Builder.getInt1(isSExt)});
+            }
+            ItoMPCI.insert(std::make_pair(&I, mpc));
+            remove = true;
+            break;
           }
           errs() << "unchanged " << I << "\n";
           break;
-        case Instruction::SExt:
-          if (gc) {
-            Function *func = cast<llvm::Function>(
-                F.getParent()
-                    ->getOrInsertFunction(
-                        GCFuncNames["bittoint"],
-                        FunctionType::get(
-                            Builder.getPtrTy(),
-                            {Builder.getPtrTy(), Builder.getInt32Ty()}, false))
-                    .getCallee());
-            Builder.SetInsertPoint(&I);
-            auto elementsize =
-                F.getParent()->getDataLayout().getTypeSizeInBits(I.getType());
-            auto mpc =
-                Builder.CreateCall(func, {ItoMPCI[I.getOperand(0)],
-                                          Builder.getInt32(elementsize)});
-            ItoMPCI.insert(std::make_pair(&I, mpc));
-            remove = true;
-          }
-          break;
+        }
         case Instruction::Trunc:
           if (gc) {
             if (I.getType() == Builder.getInt1Ty() &&
                 I.getOperand(0)->getType() == Builder.getInt8Ty()) {
-              if ((isa<LoadInst>(I.getOperand(0))) &&
-                  (ItoMPCI.find(I.getOperand(0)) != ItoMPCI.end())) {
+              if (ItoMPCI.find(I.getOperand(0)) != ItoMPCI.end() &&
+                  (isa<LoadInst>(I.getOperand(0)) ||
+                   isBitMPC(ItoMPCI[I.getOperand(0)]))) {
                 ItoMPCI.insert(std::make_pair(&I, ItoMPCI[I.getOperand(0)]));
                 remove = true;
                 break;

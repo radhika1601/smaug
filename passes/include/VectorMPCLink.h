@@ -19,6 +19,15 @@
 
 #include <map>
 
+// int64_t mangles as `long` (l) on Linux and `long long` (x) on macOS.
+#ifndef MPC_I64
+#ifdef __APPLE__
+#define MPC_I64 "x"
+#else
+#define MPC_I64 "l"
+#endif
+#endif
+
 using namespace llvm;
 
 class CheckSecretShared;
@@ -56,6 +65,14 @@ private:
                   IRBuilder<> &Builder,
                   SmallVector<Instruction *> &deleteInstructions,
                   MapVector<Value *, Instruction *> &ItoPtr, Loop *L);
+  void updateExtract(ExtractElementInst &I, Instruction *induction,
+                     Value *opCount, IRBuilder<> &Builder,
+                     SmallVector<Instruction *> &deleteInstructions,
+                     MapVector<Value *, Instruction *> &ItoPtr, Loop *L);
+  void updateNot(Instruction &I, Instruction *induction, Value *opCount,
+                 IRBuilder<> &Builder,
+                 SmallVector<Instruction *> &deleteInstructions,
+                 MapVector<Value *, Instruction *> &ItoPtr, Loop *L);
   void updateSelect(Instruction &I, Instruction *induction, Value *opCount,
                     IRBuilder<> &Builder,
                     SmallVector<Instruction *> &deleteInstructions,
@@ -203,12 +220,12 @@ private:
       {8, "_ZN3MPC9getIntPtrIaEEPN3emp7IntegerEPT_i"},
       {16, "_ZN3MPC9getIntPtrIsEEPN3emp7IntegerEPT_i"},
       {32, "_ZN3MPC9getIntPtrIiEEPN3emp7IntegerEPT_i"},
-      {64, "_ZN3MPC9getIntPtrIlEEPN3emp7IntegerEPT_i"},
+      {64, "_ZN3MPC9getIntPtrI" MPC_I64 "EEPN3emp7IntegerEPT_i"},
   };
 
   std::map<std::string, std::string> GCFuncNames = {
-      {"createInt", "_ZN3MPC9createIntEl"},
-      {"createBit", "_ZN3MPC9createBitEl"},
+      {"createInt", "_ZN3MPC9createIntE" MPC_I64},
+      {"createBit", "_ZN3MPC9createBitE" MPC_I64},
       {"xor1", "_ZN3MPC6xorBitEPN3emp3BitES2_S2_i"},
       {"xor8", "_ZN3MPC6xorIntEPN3emp7IntegerES2_S2_i"},
       {"xor16", "_ZN3MPC6xorIntEPN3emp7IntegerES2_S2_i"},
@@ -258,7 +275,7 @@ private:
       {"init8", "_ZN3MPC10getIntegerEa"},
       {"init16", "_ZN3MPC10getIntegerEs"},
       {"init32", "_ZN3MPC10getIntegerEi"},
-      {"init64", "_ZN3MPC10getIntegerEl"},
+      {"init64", "_ZN3MPC10getIntegerE" MPC_I64},
 };
 
   std::map<std::string, std::string> FuncNames = {
@@ -266,29 +283,29 @@ private:
       {"xor8", "_ZN3MPC5xorI8EPaS0_S0_ib"},
       {"xor16", "_ZN3MPC6xorI16EPsS0_S0_ib"},
       {"xor32", "_ZN3MPC6xorI32EPiS0_S0_ib"},
-      {"xor64", "_ZN3MPC6xorI64EPlS0_S0_ib"},
+      {"xor64", "_ZN3MPC6xorI64EP" MPC_I64 "S0_S0_ib"},
       {"and1", "_ZN3MPC7andBoolEPbS0_S0_ib"},
       {"add8", "_ZN3MPC5addI8EPaS0_S0_i"},
       {"add16", "_ZN3MPC6addI16EPsS0_S0_i"},
       {"add32", "_ZN3MPC6addI32EPiS0_S0_i"},
-      {"add64", "_ZN3MPC6addI64EPlS0_S0_i"},
+      {"add64", "_ZN3MPC6addI64EP" MPC_I64 "S0_S0_i"},
       {"and1", "_ZN3MPC7andBoolEPbS0_S0_ib"},
       {"and8", "_ZN3MPC5andI8EPaS0_S0_ib"},
       {"and16", "_ZN3MPC6andI16EPsS0_S0_ib"},
       {"and32", "_ZN3MPC6andI32EPiS0_S0_ib"},
-      {"and64", "_ZN3MPC6andI64EPlS0_S0_ib"},
+      {"and64", "_ZN3MPC6andI64EP" MPC_I64 "S0_S0_ib"},
       {"icmpEq8", "_ZN3MPC8icmpEqI8EPaS0_Pbii"},
       {"icmpEq16", "_ZN3MPC9icmpEqI16EPsS0_Pbii"},
       {"icmpEq32", "_ZN3MPC9icmpEqI32EPiS0_Pbii"},
-      {"icmpEq64", "_ZN3MPC9icmpEqI64EPlS0_Pbii"},
+      {"icmpEq64", "_ZN3MPC9icmpEqI64EP" MPC_I64 "S0_Pbii"},
       {"mul8", "_ZN3MPC6multI8EPaS0_S0_i"},
       {"mul16", "_ZN3MPC7multI16EPsS0_S0_i"},
       {"mul32", "_ZN3MPC7multI32EPiS0_S0_i"},
-      {"mul64", "_ZN3MPC7multI64EPlS0_S0_i"},
+      {"mul64", "_ZN3MPC7multI64EP" MPC_I64 "S0_S0_i"},
       {"sub8", "_ZN3MPC5subI8EPaS0_S0_i"},
       {"sub16", "_ZN3MPC6subI16EPsS0_S0_i"},
       {"sub32", "_ZN3MPC6subI32EPiS0_S0_i"},
-      {"sub64", "_ZN3MPC6subI64EPlS0_S0_i"},
+      {"sub64", "_ZN3MPC6subI64EP" MPC_I64 "S0_S0_i"},
       {"reduction", "_ZN3MPC9reductionEPviiS0_ib"},
       {"select", "_ZN3MPC6selectEPvS0_PbiiS0_b"},
       {"init", "_ZN3MPC5storeEPvS0_iibb"},
