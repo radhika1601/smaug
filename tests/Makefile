@@ -1,8 +1,9 @@
 # Output correctness tests: each program is run under MPC and its result is
-# compared with a native build of the same source. Two suites: the benchmarks,
-# and the operation tests in ops/. See check_outputs.py.
+# compared with a native build of the same source. Three suites: the
+# benchmarks, the operation tests in ops/, and the scalar-input tests in
+# scalar/. See check_outputs.py.
 #
-#   make check                               benchmarks and ops, all pipelines
+#   make check                               all suites, all pipelines
 #   make check SUITES=ops PIPELINES=gc,no-gc   one suite, some pipelines
 #   make check TESTS=count10,ops/xor N=64      some tests, other size
 #   make check LOWERING=legacy,new             compare the two lowerings
@@ -12,7 +13,7 @@
 
 PYTHON     ?= python3
 PIPELINES  ?= gc,no-gc,loop-flatten,loop-flatten-no-gc
-SUITES     ?= benchmarks,ops
+SUITES     ?= benchmarks,ops,scalar
 LOWERING   ?= legacy
 TESTS      ?=
 N          ?= 16

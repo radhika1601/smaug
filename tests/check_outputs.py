@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Checks that programs compute the right result under MPC.
 
-Two suites are checked. "benchmarks" covers every benchmark in SPEC.
+Three suites are checked. "benchmarks" covers every benchmark in SPEC.
 "ops" covers the operation tests in tests/ops/, one program per operation
 kind, all with the function op(a, b, out, N) and metadata tests/ops/op.ll.json.
+"scalar" covers tests/scalar/, where op(a, b) takes two secret int32_t values
+and returns an int32_t. They use tests/scalar/op.ll.json, or <name>.ll.json
+next to the test when it exists.
 For each program, a test program is generated from its source. Its main seeds rand() per party, records the inputs each
 party passes to the benchmark function, and records the function's outputs.
 The program is built through each pass pipeline and run as two parties. The
@@ -84,6 +87,7 @@ LOWERINGS = ('legacy', 'new')
 
 
 OPS = f'{HERE}/ops'
+SCALAR = f'{HERE}/scalar'
 
 
 def tests(suites):
@@ -99,6 +103,15 @@ def tests(suites):
                 t['ops/' + f[:-4]] = (
                     f'{OPS}/{f}', f'{OPS}/op.ll.json', 'op(a, b, out, N);',
                     [('a', N), ('b', N), ('out', N)], [('out', N)])
+    if 'scalar' in suites:
+        for f in sorted(os.listdir(SCALAR)):
+            if f.endswith('.cpp'):
+                own = f'{SCALAR}/{f[:-4]}.ll.json'
+                t['scalar/' + f[:-4]] = (
+                    f'{SCALAR}/{f}',
+                    own if os.path.exists(own) else f'{SCALAR}/op.ll.json',
+                    'int32_t res = op(a, b);', [('&a', '1'), ('&b', '1')],
+                    [('&res', '1')])
     return t
 
 
@@ -305,8 +318,8 @@ def trial(exe, native, name, pipe, lowering, n, mode, seed, port):
 def main():
     global BUILD
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--suites', default='benchmarks,ops',
-                    help='comma-separated suites: benchmarks, ops')
+    ap.add_argument('--suites', default='benchmarks,ops,scalar',
+                    help='comma-separated suites: benchmarks, ops, scalar')
     ap.add_argument('--tests', default='',
                     help='comma-separated test names, e.g. count10,ops/xor '
                          '(default: all tests in the suites)')
