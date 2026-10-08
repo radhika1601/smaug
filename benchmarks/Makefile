@@ -81,8 +81,8 @@ $(BUILD_DIR) $(NOLINK_DIR) $(NONGC_DIR) $(FLATTEN_DIR) $(FLATTEN_NONGC_DIR):
 $(BUILD_DIR)/%.ll: $(dir $(abspath $(lastword $(MAKEFILE_LIST))))%.cpp | $(BUILD_DIR)
 	$(CLANG) $(CXXFLAGS) $< -o $@
 	python3 $(REMOVE_TRIPLE) $@
-	$(OPT) --interleave-loops=false --mpc-lowering=$(MPC_LOWERING) \
-	    -load-pass-plugin=$(PASS_PLUGIN) \
+	$(OPT) --interleave-loops=false \
+	    -load-pass-plugin=$(PASS_PLUGIN) --mpc-lowering=$(MPC_LOWERING) \
 	    -passes=smaug-pipeline \
 	    --metadata-path=$(METADATA_DIR)/$(notdir $@).json \
 	    --gc=true \
@@ -92,8 +92,8 @@ $(BUILD_DIR)/%.ll: $(dir $(abspath $(lastword $(MAKEFILE_LIST))))%.cpp | $(BUILD
 $(NOLINK_DIR)/%.ll: $(dir $(abspath $(lastword $(MAKEFILE_LIST))))%.cpp | $(NOLINK_DIR)
 	$(CLANG) $(CXXFLAGS) $< -o $@
 	python3 $(REMOVE_TRIPLE) $@
-	$(OPT) --interleave-loops=false --mpc-lowering=$(MPC_LOWERING) \
-	    -load-pass-plugin=$(PASS_PLUGIN) \
+	$(OPT) --interleave-loops=false \
+	    -load-pass-plugin=$(PASS_PLUGIN) --mpc-lowering=$(MPC_LOWERING) \
 	    -passes=no-link-pipeline \
 	    --metadata-path=$(METADATA_DIR)/$(notdir $@).json \
 	    --gc=true \
@@ -103,8 +103,8 @@ $(NOLINK_DIR)/%.ll: $(dir $(abspath $(lastword $(MAKEFILE_LIST))))%.cpp | $(NOLI
 $(NONGC_DIR)/%.ll: $(dir $(abspath $(lastword $(MAKEFILE_LIST))))%.cpp | $(NONGC_DIR)
 	$(CLANG) $(CXXFLAGS) $< -o $@
 	python3 $(REMOVE_TRIPLE) $@
-	$(OPT) --interleave-loops=false --mpc-lowering=$(MPC_LOWERING) \
-	    -load-pass-plugin=$(PASS_PLUGIN) \
+	$(OPT) --interleave-loops=false \
+	    -load-pass-plugin=$(PASS_PLUGIN) --mpc-lowering=$(MPC_LOWERING) \
 	    -passes=smaug-pipeline \
 	    --metadata-path=$(METADATA_DIR)/$(notdir $@).json \
 	    --gc=false \
@@ -124,14 +124,14 @@ $(NONGC_BINS): $(NONGC_DIR)/%_mpc: $(NONGC_DIR)/%.ll
 $(FLATTEN_DIR)/%.ll: $(dir $(abspath $(lastword $(MAKEFILE_LIST))))%.cpp | $(FLATTEN_DIR)
 	$(CLANG) $(CXXFLAGS) $< -o $@
 	python3 $(REMOVE_TRIPLE) $@
-	$(OPT) --interleave-loops=false --mpc-lowering=$(MPC_LOWERING) \
-	    -load-pass-plugin=$(PASS_PLUGIN) \
+	$(OPT) --interleave-loops=false \
+	    -load-pass-plugin=$(PASS_PLUGIN) --mpc-lowering=$(MPC_LOWERING) \
 	    -passes=no-link-loop-flatten-pipeline \
 	    --metadata-path=$(METADATA_DIR)/$(notdir $@).json \
 	    --gc=true \
 	    $@ -o $@ -S
-	$(OPT) --interleave-loops=false --mpc-lowering=$(MPC_LOWERING) \
-	    -load-pass-plugin=$(PASS_PLUGIN) \
+	$(OPT) --interleave-loops=false \
+	    -load-pass-plugin=$(PASS_PLUGIN) --mpc-lowering=$(MPC_LOWERING) \
 	    -passes=smaug-link \
 	    --metadata-path=$(METADATA_DIR)/$(notdir $@).json \
 	    --gc=true \
@@ -145,14 +145,14 @@ $(FLATTEN_BINS): $(FLATTEN_DIR)/%_mpc: $(FLATTEN_DIR)/%.ll
 $(FLATTEN_NONGC_DIR)/%.ll: $(dir $(abspath $(lastword $(MAKEFILE_LIST))))%.cpp | $(FLATTEN_NONGC_DIR)
 	$(CLANG) $(CXXFLAGS) $< -o $@
 	python3 $(REMOVE_TRIPLE) $@
-	$(OPT) --interleave-loops=false --mpc-lowering=$(MPC_LOWERING) \
-	    -load-pass-plugin=$(PASS_PLUGIN) \
+	$(OPT) --interleave-loops=false \
+	    -load-pass-plugin=$(PASS_PLUGIN) --mpc-lowering=$(MPC_LOWERING) \
 	    -passes=no-link-loop-flatten-pipeline \
 	    --metadata-path=$(METADATA_DIR)/$(notdir $@).json \
 	    --gc=false \
 	    $@ -o $@ -S
-	$(OPT) --interleave-loops=false --mpc-lowering=$(MPC_LOWERING) \
-	    -load-pass-plugin=$(PASS_PLUGIN) \
+	$(OPT) --interleave-loops=false \
+	    -load-pass-plugin=$(PASS_PLUGIN) --mpc-lowering=$(MPC_LOWERING) \
 	    -passes=smaug-link \
 	    --metadata-path=$(METADATA_DIR)/$(notdir $@).json \
 	    --gc=false \
