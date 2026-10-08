@@ -7,6 +7,12 @@ kind, all with the function op(a, b, out, N) and metadata tests/ops/op.ll.json.
 "scalar" covers tests/scalar/, where op(a, b) takes two secret int32_t values
 and returns an int32_t. They use tests/scalar/op.ll.json, or <name>.ll.json
 next to the test when it exists.
+
+The MPC protocol is set up once per program, and setup dominates a GMW run.
+A benchmark program runs all its trials. The ops and scalar tests are each
+compiled through the pipeline on their own, then linked into one program per
+suite and pipeline that runs all of them. If that program fails to link,
+crashes or times out, each test is linked and run on its own instead.
 For each program, a test program is generated from its source. Its main seeds rand() per party, records the inputs each
 party passes to the benchmark function, and records the function's outputs.
 The program is built through each pass pipeline and run as two parties. The
@@ -25,6 +31,8 @@ import platform
 import re
 import shutil
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import subprocess as sp
 import sys
 import time
@@ -91,18 +99,20 @@ SCALAR = f'{HERE}/scalar'
 
 
 def tests(suites):
-    """name: (source, metadata, call, inputs, outputs) for the chosen suites."""
+    """name: (source, metadata, call, inputs, outputs, combined) for the
+    chosen suites. Tests of a combined suite are linked into one program per
+    pipeline (see run_combined); the others are a program each."""
     t = {}
     if 'benchmarks' in suites:
         for name, (call, ins, outs) in SPEC.items():
             t[name] = (f'{BENCH}/{name}.cpp', f'{BENCH}/metadata/{name}.ll.json',
-                       call, ins, outs)
+                       call, ins, outs, False)
     if 'ops' in suites:
         for f in sorted(os.listdir(OPS)):
             if f.endswith('.cpp'):
                 t['ops/' + f[:-4]] = (
                     f'{OPS}/{f}', f'{OPS}/op.ll.json', 'op(a, b, out, N);',
-                    [('a', N), ('b', N), ('out', N)], [('out', N)])
+                    [('a', N), ('b', N), ('out', N)], [('out', N)], True)
     if 'scalar' in suites:
         for f in sorted(os.listdir(SCALAR)):
             if f.endswith('.cpp'):
@@ -111,7 +121,7 @@ def tests(suites):
                     f'{SCALAR}/{f}',
                     own if os.path.exists(own) else f'{SCALAR}/op.ll.json',
                     'int32_t res = op(a, b);', [('&a', '1'), ('&b', '1')],
-                    [('&res', '1')])
+                    [('&res', '1')], True)
     return t
 
 
@@ -147,51 +157,189 @@ def toolchain():
     }
 
 
+# Runs the trials named in argv[4] in one process, so the MPC protocol is set
+# up once. argv: party port N trials [inputs dir], e.g. "1 14100 16 z1,r1".
+# The native reference gets an inputs dir holding <trial>_inputs.txt.
+MULTI_TRIAL_MAIN = r'''
+int main(int argc, char **argv) {
+  MPC::setup(atoi(argv[1]), atoi(argv[2]));
+  char list[256];
+  snprintf(list, sizeof list, "%s", argv[4]);
+  for (char *t = list; *t;) {
+    char *end = strchr(t, ',');
+    if (end)
+      *end = 0;
+    char seed[16], mode[2] = {t[0], 0}, inputs[512];
+    snprintf(seed, sizeof seed, "%s", t + 1);
+    char *args[8] = {argv[0], argv[1], argv[2], argv[3], seed, mode, nullptr,
+                     nullptr};
+    int n = 6;
+    if (argc > 5) {
+      snprintf(inputs, sizeof inputs, "%s/%s_inputs.txt", argv[5], t);
+      args[n++] = inputs;
+    }
+    smaug_trial_ = t;
+    smaug_trial_main(n, args);
+    if (!end)
+      break;
+    t = end + 1;
+  }
+  MPC::finish();
+}
+'''
+
+# The driver of a combined program: runs the tests named in argv[5] (ids, as
+# from test_id), each with the trials named in argv[4], after one setup.
+# argv: party port N trials tests [inputs dir]. Files are named after
+# "<id>.<trial>".
+DRIVER = r'''#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include "mpc/mpc.h"
+
+const char *smaug_trial_ = "";
+%(decls)s
+static struct {
+  const char *name;
+  void (*run)(int, char **);
+} tests_[] = {
+%(table)s
+};
+
+int main(int argc, char **argv) {
+  MPC::setup(atoi(argv[1]), atoi(argv[2]));
+  char names[8192];
+  snprintf(names, sizeof names, "%%s", argv[5]);
+  for (char *name = strtok(names, ","); name; name = strtok(nullptr, ",")) {
+    void (*run)(int, char **) = nullptr;
+    for (auto &t : tests_)
+      if (!strcmp(t.name, name))
+        run = t.run;
+    if (!run) {
+      fprintf(stderr, "unknown test %%s\n", name);
+      return 2;
+    }
+    printf("running %%s\n", name);
+    fflush(stdout);
+    char list[256];
+    snprintf(list, sizeof list, "%%s", argv[4]);
+    for (char *t = list; *t;) {
+      char *end = strchr(t, ',');
+      if (end)
+        *end = 0;
+      char seed[16], mode[2] = {t[0], 0}, tag[320], inputs[1024];
+      snprintf(seed, sizeof seed, "%%s", t + 1);
+      snprintf(tag, sizeof tag, "%%s.%%s", name, t);
+      char *args[8] = {argv[0], argv[1], argv[2], argv[3], seed, mode, nullptr,
+                       nullptr};
+      int n = 6;
+      if (argc > 6) {
+        snprintf(inputs, sizeof inputs, "%%s/%%s_inputs.txt", argv[6], tag);
+        args[n++] = inputs;
+      }
+      smaug_trial_ = tag;
+      run(n, args);
+      if (!end)
+        break;
+      t = end + 1;
+    }
+  }
+  MPC::finish();
+}
+'''
+
+
+def test_id(name):
+    return name.replace('/', '_')
+
+
+def driver_source(ids, path):
+    """Writes the driver of a combined program running the tests in ids."""
+    decls = '\n'.join(f'void smaug_trial_{i}(int argc, char **argv);'
+                      for i in ids)
+    table = '\n'.join(f'    {{"{i}", smaug_trial_{i}}},' for i in ids)
+    with open(path, 'w') as f:
+        f.write(DRIVER % {'decls': decls, 'table': table})
+    return path
+
+
 def generate(name, test):
-    """Writes the test program for one test and returns its path."""
-    src, _, call, ins, outs = test
+    """Writes the test program for one test and returns (source, metadata).
+    A test of a combined suite becomes a library: its op is renamed
+    smaug_op_<id>, with a metadata file to match, and its main becomes
+    smaug_trial_<id>, run by the driver."""
+    src, metadata, call, ins, outs, combined = test
     s = open(src).read()
     s = '#include <cstdio>\n#include <cstring>\n#include "harness.h"\n' + s
     # Seed per party so each party's inputs are reproducible.
     s, k = re.subn(r'srand\(\(unsigned\)time\(&t\)\);',
                    'srand(atoi(argv[4]) * 10 + atoi(argv[1]));', s)
-    if k != 1 or s.count(call) != 1:
+    # The original main runs one trial. The protocol is set up once, in the
+    # main added below, so its own setup and finish calls go.
+    s, m = re.subn(r'int main\(int argc, char\s*\*\s*\*\s*argv\)',
+                   'void smaug_trial_main(int argc, char **argv)', s)
+    s, k2 = re.subn(r'MPC::setup\(atoi\(argv\[1\]\), atoi\(argv\[2\]\)\);',
+                    '', s)
+    s = s.replace('MPC::finish();', '')
+    if k != 1 or m != 1 or k2 != 1 or s.count(call) != 1:
         sys.exit(f'{name}: main does not match the expected shape')
-    # argv: party port N seed mode [inputs file]. With an inputs file the
-    # program is the native reference: it loads the combined inputs.
+    # Trial argv: party port N seed mode [inputs file]. With an inputs file
+    # the program is the native reference: it loads the combined inputs.
     pre = ['  {', '    int party_ = atoi(argv[1]);', '    if (argc > 6) {']
     pre += [f'      hload(argv[6], "{a}", {a}, {n});' for a, n in ins]
     pre += ['    } else {', "      if (party_ == 2 && argv[5][0] == 'z') {"]
     pre += [f'        memset({a}, 0, sizeof(int32_t) * ({n}));' for a, n in ins]
     pre += ['      }', '      char f_[64];',
-            '      snprintf(f_, 64, "in_p%d.txt", party_);']
+            '      snprintf(f_, 64, "%s_in_p%d.txt", smaug_trial_, party_);']
     pre += [f'      hdump(f_, "{a}", {a}, {n});' for a, n in ins]
     pre += ['    }', '  }']
     post = ['  {', '    char f_[64];', '    if (argc > 6)',
-            '      snprintf(f_, 64, "out_ref.txt");', '    else',
-            '      snprintf(f_, 64, "out_p%d.txt", atoi(argv[1]));']
+            '      snprintf(f_, 64, "%s_out_ref.txt", smaug_trial_);', '    else',
+            '      snprintf(f_, 64, "%s_out_p%d.txt", smaug_trial_, atoi(argv[1]));']
     post += [f'    hdump(f_, "{a}", {a}, {n});' for a, n in outs]
     # AND gates used so far; the comparison ignores names starting with #.
     post += ['    int gates_ = MPC::getNumGates();',
              '    hdump(f_, "#gates", &gates_, 1);', '  }']
     s = s.replace(call, '\n'.join(pre) + '\n  ' + call + '\n' + '\n'.join(post))
     os.makedirs(f'{BUILD}/src', exist_ok=True)
-    path = f'{BUILD}/src/{name.replace("/", "_")}.cpp'
+    tid = test_id(name)
+    if combined:
+        fn = f'smaug_op_{tid}'
+        s = re.sub(r'\bop\(', fn + '(', s)
+        s = s.replace('void smaug_trial_main(', f'void smaug_trial_{tid}(')
+        s = s.replace('#include "harness.h"\n', '#include "harness.h"\n'
+                      'extern const char *smaug_trial_;\n', 1)
+        # The metadata of op, under the renamed function's mangled name.
+        meta = json.load(open(metadata))
+        renamed = {}
+        for key, val in meta.items():
+            if key.startswith('_Z2op'):
+                renamed[f'_Z{len(fn)}{fn}' + key[len('_Z2op'):]] = val
+        metadata = f'{BUILD}/src/{tid}.ll.json'
+        with open(metadata, 'w') as f:
+            json.dump(renamed, f, indent=1)
+    else:
+        s = s.replace('#include "harness.h"\n', '#include "harness.h"\n'
+                      'static const char *smaug_trial_ = "";\n', 1)
+        s += MULTI_TRIAL_MAIN
+    path = f'{BUILD}/src/{tid}.cpp'
     open(path, 'w').write(s)
-    return path
+    return path, metadata
 
 
 def run(cmd):
     return sp.run(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
 
 
-def build(tc, name, src, metadata, pipe, lowering):
+def build(tc, name, src, metadata, pipe, lowering, link=True):
     """Returns (executable, None) or (None, (status, message)), where status
-    is 'unsupported' for an mpc-lower diagnostic and 'build' otherwise."""
+    is 'unsupported' for an mpc-lower diagnostic and 'build' otherwise.
+    Without link, returns the transformed .ll instead of an executable."""
     gc, lib, stages = PIPELINES[pipe]
     d = f'{BUILD}/{lowering}/{pipe}'
     os.makedirs(d, exist_ok=True)
-    stem = name.replace('/', '_')
+    stem = test_id(name)
     ll, exe = f'{d}/{stem}.ll', f'{d}/{stem}'
     plugin = ['--interleave-loops=false', f'-load-pass-plugin={tc["plugin"]}',
               f'--metadata-path={metadata}', f'--gc={gc}',
@@ -202,41 +350,68 @@ def build(tc, name, src, metadata, pipe, lowering):
              ['python3', f'{ROOT}/passes/remove_target_triple.py', ll]]
     steps += [[tc['opt']] + plugin + [f'-passes={p}', ll, '-o', ll, '-S']
               for p in stages]
-    steps += [[tc['clang']] + tc['link'] + [
-        '-lssl', '-lcrypto', '-lemp-tool', f'-l{lib}',
-        '-Wno-deprecated-declarations', ll, f'{BUILD}/harness.o',
-        '-std=c++17', '-o', exe]]
+    if link:
+        steps += [link_command(tc, lib, [ll], exe)]
     for s in steps:
         r = run(s)
         if r.returncode:
-            lines = r.stdout.splitlines()
-            unsupported = [l for l in lines if 'mpc-lower: error' in l]
-            if unsupported:
-                return None, ('unsupported', unsupported[0].strip()[:220])
-            # Report the most informative line: a fatal error or assertion
-            # before a generic error line, and never a backtrace frame.
-            msg = None
-            for key in ('LLVM ERROR', 'fatal error', 'Assertion', 'error:',
-                        'Segmentation'):
-                hits = [l for l in lines if key in l and
-                        not l.lstrip().startswith('#')]
-                if hits:
-                    msg = hits[0]
-                    break
-            return None, ('build', f'{os.path.basename(s[0])} failed: '
-                          f'{(msg or r.stdout[-200:]).strip()[:220]}')
-    return exe, None
+            return None, build_error(s, r)
+    return (exe if link else ll), None
 
 
-def build_native(tc, name, src):
-    exe = f'{BUILD}/native/{name.replace("/", "_")}'
-    os.makedirs(os.path.dirname(exe), exist_ok=True)
+def link_command(tc, lib, inputs, exe):
+    return [tc['clang']] + tc['link'] + [
+        f'-I{tc["prefix"]}/include', '-lssl', '-lcrypto', '-lemp-tool',
+        f'-l{lib}', '-Wno-deprecated-declarations'] + inputs + [
+        f'{BUILD}/harness.o', '-std=c++17', '-o', exe]
+
+
+def build_error(step, r):
+    """(status, message) for a build step that failed with result r."""
+    lines = r.stdout.splitlines()
+    unsupported = [l for l in lines if 'mpc-lower: error' in l]
+    if unsupported:
+        return ('unsupported', unsupported[0].strip()[:220])
+    # Report the most informative line: a fatal error or assertion before a
+    # generic error line, and never a backtrace frame.
+    msg = None
+    for key in ('LLVM ERROR', 'fatal error', 'Assertion', 'error:',
+                'Segmentation'):
+        hits = [l for l in lines if key in l and not l.lstrip().startswith('#')]
+        if hits:
+            msg = hits[0]
+            break
+    return ('build', f'{os.path.basename(step[0])} failed: '
+            f'{(msg or r.stdout[-200:]).strip()[:220]}')
+
+
+def build_native(tc, name, src, combined):
+    """The native reference: an executable, or for a test of a combined
+    suite an object file that native_combined links."""
+    out = f'{BUILD}/native/{test_id(name)}' + ('.o' if combined else '')
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if combined:
+        cmd = [src, '-c']
+    else:
+        cmd = [src, f'{HERE}/harness/mpc_stub.cpp',
+               f'{HERE}/harness/harness.cpp']
     r = run([tc['clang'], '-O0', '-std=c++17', f'-I{tc["prefix"]}/include',
-             f'-I{HERE}/harness'] + tc['sysroot'] + [
-        src, f'{HERE}/harness/mpc_stub.cpp', f'{HERE}/harness/harness.cpp',
-        '-o', exe])
+             f'-I{HERE}/harness'] + tc['sysroot'] + cmd + ['-o', out])
     if r.returncode:
         sys.exit(f'native build of {name} failed:\n{r.stdout}')
+    return out
+
+
+def native_combined(tc, suite, names, objects):
+    """The native reference of a combined suite: every test in it."""
+    exe = f'{BUILD}/native/{suite}'
+    driver = driver_source([test_id(n) for n in names], f'{exe}_driver.cpp')
+    r = run([tc['clang'], '-O0', '-std=c++17', f'-I{tc["prefix"]}/include',
+             f'-I{HERE}/harness'] + tc['sysroot'] + [
+        driver] + objects + [f'{HERE}/harness/mpc_stub.cpp',
+                             f'{HERE}/harness/harness.cpp', '-o', exe])
+    if r.returncode:
+        sys.exit(f'native build of {suite} failed:\n{r.stdout}')
     return exe
 
 
@@ -264,13 +439,17 @@ def free_port(port, span=4):
             port += span
 
 
-def trial(exe, native, name, pipe, lowering, n, mode, seed, port):
-    """Returns (status, detail, gates); status is pass, wrong, crash,
-    timeout or missing."""
-    d = f'{BUILD}/run/{lowering}/{pipe}/{name.replace("/", "_")}/{mode}{seed}'
+def trials(exe, native, d, n, names, port, ids=None):
+    """Runs the trials in names (e.g. ['z1', 'r1']) in one process pair in
+    directory d and returns {tag: (status, detail, gates)}; status is pass,
+    wrong, crash, timeout or missing. For a combined program, ids names its
+    tests and a tag is "<id>.<trial>"; otherwise a tag is the trial."""
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(f'{d}/data')  # emp-aby stores pre-OT data here
-    args = [str(n), str(seed), mode]
+    args = [str(n), ','.join(names)]
+    if ids is not None:
+        args.append(','.join(ids))
+        names = [f'{i}.{t}' for i in ids for t in names]
     p1 = sp.Popen([exe, '1', str(port)] + args, cwd=d,
                   stdout=open(f'{d}/p1.log', 'w'), stderr=sp.STDOUT)
     time.sleep(0.3)
@@ -281,39 +460,50 @@ def trial(exe, native, name, pipe, lowering, n, mode, seed, port):
         r1 = p1.wait(timeout=60)
     except sp.TimeoutExpired:
         p1.kill()
-        return 'timeout', '', None
+        return {t: ('timeout', '', None) for t in names}
     if r1 or r2:
-        return 'crash', f'exit codes party1={r1} party2={r2}', None
-    i1, i2 = parse(f'{d}/in_p1.txt'), parse(f'{d}/in_p2.txt')
-    o1, o2 = parse(f'{d}/out_p1.txt'), parse(f'{d}/out_p2.txt')
-    if not (i1 and i2 and o1 and o2):
-        return 'missing', 'missing input or output dump', None
-    gates = o1.get('#gates', [None])[0]
-    with open(f'{d}/inputs.txt', 'w') as f:
-        for k in i1:
-            vals = ' '.join(str(a ^ b) for a, b in zip(i1[k], i2[k]))
-            f.write(f'{k} {len(i1[k])} {vals}\n')
-    sp.run([native, '1', '0'] + args + [f'{d}/inputs.txt'], cwd=d,
+        return {t: ('crash', f'exit codes party1={r1} party2={r2}', None)
+                for t in names}
+    dumps = {}
+    for t in names:
+        i1, i2 = parse(f'{d}/{t}_in_p1.txt'), parse(f'{d}/{t}_in_p2.txt')
+        o1, o2 = parse(f'{d}/{t}_out_p1.txt'), parse(f'{d}/{t}_out_p2.txt')
+        if not (i1 and i2 and o1 and o2):
+            continue
+        dumps[t] = (o1, o2)
+        with open(f'{d}/{t}_inputs.txt', 'w') as f:
+            for k in i1:
+                vals = ' '.join(str(a ^ b) for a, b in zip(i1[k], i2[k]))
+                f.write(f'{k} {len(i1[k])} {vals}\n')
+    sp.run([native, '1', '0'] + args + [d], cwd=d,
            stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-    ref = parse(f'{d}/out_ref.txt')
-    if not ref:
-        return 'missing', 'native reference produced no output', gates
-    errors = []
-    for k, want in ref.items():
-        if k.startswith('#'):
+    out = {}
+    for t in names:
+        if t not in dumps:
+            out[t] = ('missing', 'missing input or output dump', None)
             continue
-        a, b = o1[k], o2[k]
-        shared = [x ^ y for x, y in zip(a, b)]
-        if a == want or shared == want:
+        o1, o2 = dumps[t]
+        gates = o1.get('#gates', [None])[0]
+        ref = parse(f'{d}/{t}_out_ref.txt')
+        if not ref:
+            out[t] = ('missing', 'native reference produced no output', gates)
             continue
-        bad = [i for i in range(len(want)) if a[i] != want[i]
-               and shared[i] != want[i]]
-        i = bad[0]
-        errors.append(f'{k}: {len(bad)}/{len(want)} wrong, e.g. [{i}] '
-                      f'expected {want[i]}, party1 {a[i]}, '
-                      f'party1^party2 {shared[i]}')
-    return ('wrong' if errors else 'pass'), '; '.join(errors), gates
-
+        errors = []
+        for k, want in ref.items():
+            if k.startswith('#'):
+                continue
+            a, b = o1[k], o2[k]
+            shared = [x ^ y for x, y in zip(a, b)]
+            if a == want or shared == want:
+                continue
+            bad = [i for i in range(len(want)) if a[i] != want[i]
+                   and shared[i] != want[i]]
+            i = bad[0]
+            errors.append(f'{k}: {len(bad)}/{len(want)} wrong, e.g. [{i}] '
+                          f'expected {want[i]}, party1 {a[i]}, '
+                          f'party1^party2 {shared[i]}')
+        out[t] = (('wrong' if errors else 'pass'), '; '.join(errors), gates)
+    return out
 
 def main():
     global BUILD
@@ -335,6 +525,11 @@ def main():
     ap.add_argument('--port', type=int, default=14100, help='first port')
     ap.add_argument('--build-dir', default=BUILD,
                     help='directory for build and run outputs')
+    ap.add_argument('-j', '--jobs', type=int,
+                    default=max(1, (os.cpu_count() or 2) // 2),
+                    help='test/pipeline builds and runs to do at once '
+                         '(default: half the CPUs; a GMW trial uses about '
+                         'two cores per party)')
     a = ap.parse_args()
     BUILD = os.path.abspath(a.build_dir)
     table = tests(a.suites.split(','))
@@ -358,37 +553,138 @@ def main():
     if r.returncode:
         sys.exit(r.stdout)
 
-    port, results = a.port, []
+    results = []
+    lock = threading.Lock()
+    next_port = [a.port]
+
+    def take_port():
+        # Each trial gets its own range of ports; free_port skips ports that
+        # other programs hold.
+        with lock:
+            port = free_port(next_port[0] + 1)
+            next_port[0] = port + 4
+            return port
 
     def record(lowering, name, pipe, trial_name, status, detail, gates):
-        results.append({'lowering': lowering, 'test': name, 'pipeline': pipe,
-                        'trial': trial_name, 'status': status,
-                        'detail': detail, 'gates': gates})
         prefix = f'{lowering} ' if len(lowerings) > 1 else ''
         label = f'{prefix}{name} {pipe}' + (f' {trial_name}' if trial_name
                                             else '')
-        if status == 'pass':
-            print(f'PASS: {label}', flush=True)
-        else:
-            print(f'FAIL: {label}: {status}: {detail}', flush=True)
+        with lock:
+            results.append({'lowering': lowering, 'test': name,
+                            'pipeline': pipe, 'trial': trial_name,
+                            'status': status, 'detail': detail,
+                            'gates': gates})
+            if status == 'pass':
+                print(f'PASS: {label}', flush=True)
+            else:
+                print(f'FAIL: {label}: {status}: {detail}', flush=True)
 
-    for name in names:
-        src = generate(name, table[name])
-        native = build_native(tc, name, src)
-        for lowering in lowerings:
-            for pipe in pipes:
-                exe, err = build(tc, name, src, table[name][1], pipe, lowering)
-                if not exe:
-                    record(lowering, name, pipe, '', err[0], err[1], None)
-                    continue
-                for mode in ('z', 'r'):
-                    for seed in a.seeds.split(','):
-                        port = free_port(port + 1)
-                        status, detail, gates = trial(
-                            exe, native, name, pipe, lowering, a.n, mode,
-                            int(seed), port)
-                        record(lowering, name, pipe, f'{mode}{seed}', status,
-                               detail, gates)
+    trial_names = [f'{mode}{seed}' for mode in ('z', 'r')
+                   for seed in a.seeds.split(',')]
+    standalone = [n for n in names if not table[n][5]]
+    suites = {}
+    for n in names:
+        if table[n][5]:
+            suites.setdefault(n.split('/')[0], []).append(n)
+
+    # The test program, its metadata and its native reference are made once
+    # per test, by the first build that needs them.
+    prepared, prep_locks = {}, {name: threading.Lock() for name in names}
+
+    def prepare(name):
+        with prep_locks[name]:
+            if name not in prepared:
+                src, meta = generate(name, table[name])
+                prepared[name] = (src, meta,
+                                  build_native(tc, name, src, table[name][5]))
+            return prepared[name]
+
+    # Phase 1: every build. A test of a combined suite builds to a .ll.
+    built = {}
+
+    def build_unit(name, lowering, pipe):
+        src, meta, _ = prepare(name)
+        path, err = build(tc, name, src, meta, pipe, lowering,
+                          link=not table[name][5])
+        if err:
+            record(lowering, name, pipe, '', err[0], err[1], None)
+        with lock:
+            built[(name, lowering, pipe)] = path
+
+    # Phase 2: the runs.
+    def run_standalone(name, lowering, pipe):
+        exe = built[(name, lowering, pipe)]
+        if not exe:
+            return
+        d = f'{BUILD}/run/{lowering}/{pipe}/{test_id(name)}'
+        res = trials(exe, prepare(name)[2], d, a.n, trial_names, take_port())
+        for t in trial_names:
+            record(lowering, name, pipe, t, *res[t])
+
+    natives, native_lock = {}, threading.Lock()
+
+    def native_suite(suite):
+        with native_lock:
+            if suite not in natives:
+                ns = suites[suite]
+                natives[suite] = native_combined(
+                    tc, suite, ns, [prepare(n)[2] for n in ns])
+            return natives[suite]
+
+    def run_group(suite, lowering, pipe, group, tag):
+        """Links the tests in group into one program and runs them. Returns
+        {name: {trial: result}}, or None if linking failed or the program
+        crashed or timed out, so that the caller can narrow it down."""
+        lib = PIPELINES[pipe][1]
+        d = f'{BUILD}/{lowering}/{pipe}'
+        ids = [test_id(n) for n in group]
+        exe = f'{d}/{suite}_{tag}'
+        driver = driver_source(ids, f'{exe}_driver.cpp')
+        r = run(link_command(tc, lib, [driver] + [
+            built[(n, lowering, pipe)] for n in group], exe))
+        if r.returncode:
+            return None, build_error(link_command(tc, lib, [], exe), r)
+        res = trials(exe, native_suite(suite),
+                     f'{BUILD}/run/{lowering}/{pipe}/{suite}_{tag}', a.n,
+                     trial_names, take_port(), ids)
+        if any(v[0] in ('crash', 'timeout') for v in res.values()):
+            return None, (next(v for v in res.values()
+                               if v[0] in ('crash', 'timeout'))[:2])
+        return {n: {t: res[f'{test_id(n)}.{t}'] for t in trial_names}
+                for n in group}, None
+
+    def run_combined(suite, lowering, pipe):
+        group = [n for n in suites[suite] if built[(n, lowering, pipe)]]
+        if not group:
+            return
+        out, _ = run_group(suite, lowering, pipe, group, 'combined')
+        if out is None:
+            # Run each test on its own to find the one that failed.
+            out = {}
+            for n in group:
+                one, err = run_group(suite, lowering, pipe, [n],
+                                     'single_' + test_id(n))
+                if one is None:
+                    for t in trial_names:
+                        record(lowering, n, pipe, t, err[0], err[1], None)
+                else:
+                    out.update(one)
+        for n, res in out.items():
+            for t in trial_names:
+                record(lowering, n, pipe, t, *res[t])
+
+    with ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
+        for f in [pool.submit(build_unit, n, l, p)
+                  for n in names for l in lowerings for p in pipes]:
+            f.result()  # re-raise errors from the workers
+        runs = [pool.submit(run_standalone, n, l, p)
+                for n in standalone for l in lowerings for p in pipes]
+        runs += [pool.submit(run_combined, su, l, p)
+                 for su in suites for l in lowerings for p in pipes]
+        for f in runs:
+            f.result()
+    results.sort(key=lambda r: (r['lowering'], r['test'], r['pipeline'],
+                                r['trial']))
 
     with open(f'{BUILD}/results.json', 'w') as f:
         json.dump(results, f, indent=1)

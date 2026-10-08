@@ -76,6 +76,8 @@ There are three suites:
 
 Each program gets four trials: two seeds, each with party 2's inputs set to zero and with both parties' inputs random.
 
+Setting up the MPC protocol takes about 10 seconds in GMW, so it is done once per program. A benchmark program runs all its trials. The `ops` and `scalar` tests are compiled one by one and then linked into one program per suite and pipeline. A test that does not build is left out of that program and reported on its own. Builds and runs go in parallel; `JOBS=N` sets how many at once (default: half the CPUs).
+
 ## Benchmarks
 
 | Program | Description | Input Size |
