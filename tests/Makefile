@@ -7,6 +7,7 @@
 #   make check SUITES=ops PIPELINES=gc,no-gc   one suite, some pipelines
 #   make check TESTS=count10,ops/xor N=64      some tests, other size
 #   make check LOWERING=legacy,new             compare the two lowerings
+#   make check JOBS=2                          fewer builds and runs at once
 #
 # Tool locations follow benchmarks/Makefile: LLVM_PREFIX, SMAUG_PREFIX and
 # OPENSSL_PREFIX can be set in the environment.
@@ -18,11 +19,15 @@ LOWERING   ?= legacy
 TESTS      ?=
 N          ?= 16
 SEEDS      ?= 1,2
+JOBS       ?=
 
 ARGS := --suites $(SUITES) --pipelines $(PIPELINES) --lowering $(LOWERING) \
         -n $(N) --seeds $(SEEDS)
 ifneq ($(TESTS),)
 ARGS += --tests $(TESTS)
+endif
+ifneq ($(JOBS),)
+ARGS += -j $(JOBS)
 endif
 
 .PHONY: check clean
