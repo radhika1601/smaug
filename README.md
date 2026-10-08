@@ -69,9 +69,10 @@ make -C tests check SUITES=ops PIPELINES=gc,no-gc
 make -C tests check TESTS=count10,ops/xor N=64
 ```
 
-There are two suites:
+There are three suites:
 - `benchmarks`: the programs in `benchmarks/`. A new benchmark needs an entry in `SPEC` in `tests/check_outputs.py`.
 - `ops`: one small program per operation kind in `tests/ops/`, e.g. elementwise `xor`, comparisons, reductions and loop-carried loops. All of them define `op(a, b, out, N)` and share `tests/ops/op.ll.json`, so a new operation test is one `.cpp` file.
+- `scalar`: programs in `tests/scalar/` whose `int32_t op(int32_t a, int32_t b)` takes two secret values and returns one, e.g. comparisons, selects and secret branches. They share `tests/scalar/op.ll.json`, which reveals the result. A test with its own `<name>.ll.json` uses that instead, e.g. `lt_share` returns its result as shares.
 
 Each program gets four trials: two seeds, each with party 2's inputs set to zero and with both parties' inputs random.
 

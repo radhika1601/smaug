@@ -4,12 +4,15 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <optional>
+
 #include "MPCHierarchical.h"
 #include "MPCLink.h"
 #include "../include/MPCLoopFlatten.h"
 #include "MPCLoopMemAlign.h"
 #include "MPCLoopReconstruct.h"
 #include "MPCRemoveOps.h"
+#include "Options.h"
 #include "Metadata.h"
 #include "MetadataHelper.h"
 #include "ParallelizeReductions.h"
@@ -17,6 +20,7 @@
 #include "VectorMPCLink.h"
 #include "VectorizeHelper.h"
 #include "Vectorize/LoopVectorize.h"
+#include "lower/MPCLower.h"
 
 using namespace llvm;
 
@@ -48,6 +52,14 @@ bool registerModulePasses(StringRef Name, ModulePassManager& MPM, ArrayRef<PassB
     }
     if (Name == "vec-mpc-link") {
         MPM.addPass(VectorMPCLinkPass());
+        return true;
+    }
+    if (Name == "mpc-lower") {
+        MPM.addPass(smaug::MPCLowerPass());
+        return true;
+    }
+    if (Name == "mpc-narrow-bool") {
+        MPM.addPass(smaug::MPCNarrowBoolPass());
         return true;
     }
     return false;
@@ -191,8 +203,11 @@ static const std::string MpcO3 =
     "globaldce,constmerge,cg-profile,rel-lookup-table-converter,"
     "function(annotation-remarks)";
 
-static std::string buildSmaugPipeline() {
-    return
+// The stages shared by every pipeline, up to the point where the code is
+// lowered to MPC calls. flatten adds mpc-loop-flatten and
+// mpc-loop-reconstruct around vec-help; vectorize adds mpc-loop-vectorize.
+static std::string buildPrefix(bool flatten, bool vectorize) {
+    std::string p =
         MpcO1 + ",loop-flatten,"
         "instcombine,dce,loop-simplify,unify-loop-exits,lcssa,"
         "secshared-metadata,"
@@ -202,178 +217,73 @@ static std::string buildSmaugPipeline() {
         "secshared-metadata,"
         "mpc-hierarchical,"
         + MpcO3 + ","
-        "secshared-metadata,"
-        "function(vec-help),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
-        "secshared-metadata,"
-        "function(mpc-mem-align),instcombine,dce,loop-deletion,"
-        "function(simplifycfg,sroa,early-cse,gvn-hoist,memcpyopt,sccp,bdce,"
-        "loop-mssa(licm,loop-rotate),mem2reg,lcssa,indvars,loop-idiom,"
-        "loop-simplifycfg,loop-sink,loop-load-elim,loop-interchange,"
-        "loop-reduce,loop-unroll),"
-        "secshared-metadata,"
-        "function(mpc-loop-vectorize),"
-        "function(instcombine<max-iterations=10;>,dce),"
-        "secshared-metadata,"
-        "vec-mpc-link,"
-        "default<O1>,"
-        "secshared-metadata,"
-        "mpc-remove-ops,dce,"
-        "secshared-metadata,"
-        "mpc-link,"
-        "default<O1>";
+        "secshared-metadata,";
+    if (flatten)
+        p += "function(mpc-loop-flatten),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
+             "secshared-metadata,";
+    p += "function(vec-help),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
+         "secshared-metadata,";
+    if (flatten)
+        p += "function(mpc-loop-reconstruct),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
+             "secshared-metadata,";
+    p += "function(mpc-mem-align),instcombine,dce,loop-deletion,"
+         "function(simplifycfg,sroa,early-cse,gvn-hoist,memcpyopt,sccp,bdce,"
+         "loop-mssa(licm,loop-rotate),mem2reg,lcssa,indvars,loop-idiom,"
+         "loop-simplifycfg,loop-sink,loop-load-elim,loop-interchange,"
+         "loop-reduce,loop-unroll),"
+         "secshared-metadata,";
+    if (vectorize)
+        p += "function(mpc-loop-vectorize),";
+    p += "function(instcombine<max-iterations=10;>,dce),"
+         "secshared-metadata";
+    return p;
 }
 
-static std::string buildNoLinkPipeline() {
-    return
-        MpcO1 + ",loop-flatten,"
-        "instcombine,dce,loop-simplify,unify-loop-exits,lcssa,"
-        "secshared-metadata,"
-        "mpc-hierarchical,"
-        + MpcO3 + ","
-        "loop-simplify,"
-        "secshared-metadata,"
-        "mpc-hierarchical,"
-        + MpcO3 + ","
-        "secshared-metadata,"
-        "function(vec-help),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
-        "secshared-metadata,"
-        "function(mpc-mem-align),instcombine,dce,loop-deletion,"
-        "function(simplifycfg,sroa,early-cse,gvn-hoist,memcpyopt,sccp,bdce,"
-        "loop-mssa(licm,loop-rotate),mem2reg,lcssa,indvars,loop-idiom,"
-        "loop-simplifycfg,loop-sink,loop-load-elim,loop-interchange,"
-        "loop-reduce,loop-unroll),"
-        "secshared-metadata,"
-        "function(mpc-loop-vectorize),"
-        "function(instcombine<max-iterations=10;>,dce),"
-        "secshared-metadata";
+// The stage that lowers the code to MPC runtime calls, chosen by
+// --mpc-lowering.
+static std::string buildLinkStage() {
+    if (Lowering == MPCLowering::New)
+        return "mpc-narrow-bool,mpc-lower,default<O1>";
+    // No optimization between vec-mpc-link and mpc-link. vec-mpc-link moves
+    // vector loops onto new MPC buffers, and the scalar loops that fill those
+    // buffers still write the originals until mpc-link redirects them. An
+    // optimization pass in between deletes those scalar loops as dead stores.
+    return "vec-mpc-link,"
+           "secshared-metadata,"
+           "mpc-remove-ops,dce,"
+           "secshared-metadata,"
+           "mpc-link,"
+           "default<O1>";
 }
 
-bool registerSmaugPipeline(StringRef Name, ModulePassManager& MPM, ArrayRef<PassBuilder::PipelineElement>) {
-    if (Name != "smaug-pipeline")
+static std::optional<std::string> namedPipeline(StringRef Name) {
+    if (Name == "smaug-pipeline")
+        return buildPrefix(false, true) + "," + buildLinkStage();
+    if (Name == "smaug-pipeline-novec")
+        return buildPrefix(false, false) + "," + buildLinkStage();
+    if (Name == "loop-flatten-pipeline")
+        return buildPrefix(true, true) + "," + buildLinkStage();
+    if (Name == "loop-flatten-pipeline-novec")
+        return buildPrefix(true, false) + "," + buildLinkStage();
+    if (Name == "no-link-pipeline")
+        return buildPrefix(false, true);
+    if (Name == "no-link-loop-flatten-pipeline")
+        return buildPrefix(true, true);
+    if (Name == "smaug-link")
+        return buildLinkStage();
+    return std::nullopt;
+}
+
+bool registerNamedPipelines(StringRef Name, ModulePassManager& MPM, ArrayRef<PassBuilder::PipelineElement>) {
+    std::optional<std::string> pipeline = namedPipeline(Name);
+    if (!pipeline)
         return false;
 
     PassBuilder LocalPB(/*TM=*/nullptr);
     LocalPB.registerPipelineParsingCallback(registerModulePasses);
     LocalPB.registerPipelineParsingCallback(registerFunctionPasses);
-
-    std::string pipeline = buildSmaugPipeline();
-    if (auto Err = LocalPB.parsePassPipeline(MPM, pipeline)) {
-        logAllUnhandledErrors(std::move(Err), errs(), "smaug-pipeline: ");
-        return false;
-    }
-    return true;
-}
-
-bool registerNoLinkPipeline(StringRef Name, ModulePassManager& MPM, ArrayRef<PassBuilder::PipelineElement>) {
-    if (Name != "no-link-pipeline")
-        return false;
-
-    PassBuilder LocalPB(/*TM=*/nullptr);
-    LocalPB.registerPipelineParsingCallback(registerModulePasses);
-    LocalPB.registerPipelineParsingCallback(registerFunctionPasses);
-
-    std::string pipeline = buildNoLinkPipeline();
-    if (auto Err = LocalPB.parsePassPipeline(MPM, pipeline)) {
-        logAllUnhandledErrors(std::move(Err), errs(), "no-link-pipeline: ");
-        return false;
-    }
-    return true;
-}
-
-static std::string buildNoLinkLoopFlattenPipeline() {
-    return
-        MpcO1 + ",loop-flatten,"
-        "instcombine,dce,loop-simplify,unify-loop-exits,lcssa,"
-        "secshared-metadata,"
-        "mpc-hierarchical,"
-        + MpcO3 + ","
-        "loop-simplify,"
-        "secshared-metadata,"
-        "mpc-hierarchical,"
-        + MpcO3 + ","
-        "secshared-metadata,"
-        "function(mpc-loop-flatten),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
-        "secshared-metadata,"
-        "function(vec-help),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
-        "secshared-metadata,"
-        "function(mpc-loop-reconstruct),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
-        "secshared-metadata,"
-        "function(mpc-mem-align),instcombine,dce,loop-deletion,"
-        "function(simplifycfg,sroa,early-cse,gvn-hoist,memcpyopt,sccp,bdce,"
-        "loop-mssa(licm,loop-rotate),mem2reg,lcssa,indvars,loop-idiom,"
-        "loop-simplifycfg,loop-sink,loop-load-elim,loop-interchange,"
-        "loop-reduce,loop-unroll),"
-        "secshared-metadata,"
-        "function(mpc-loop-vectorize),"
-        "function(instcombine<max-iterations=10;>,dce),"
-        "secshared-metadata";
-}
-
-// smaug-pipeline with mpc-loop-flatten and mpc-loop-reconstruct added around
-// vec-help, matching the with-loop-flatten target in the legacy Makefile.
-static std::string buildLoopFlattenPipeline() {
-    return
-        MpcO1 + ",loop-flatten,"
-        "instcombine,dce,loop-simplify,unify-loop-exits,lcssa,"
-        "secshared-metadata,"
-        "mpc-hierarchical,"
-        + MpcO3 + ","
-        "loop-simplify,"
-        "secshared-metadata,"
-        "mpc-hierarchical,"
-        + MpcO3 + ","
-        "secshared-metadata,"
-        "function(mpc-loop-flatten),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
-        "secshared-metadata,"
-        "function(vec-help),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
-        "secshared-metadata,"
-        "function(mpc-loop-reconstruct),instcombine,dce,loop-deletion,simplifycfg,loop-simplify,"
-        "secshared-metadata,"
-        "function(mpc-mem-align),instcombine,dce,loop-deletion,"
-        "function(simplifycfg,sroa,early-cse,gvn-hoist,memcpyopt,sccp,bdce,"
-        "loop-mssa(licm,loop-rotate),mem2reg,lcssa,indvars,loop-idiom,"
-        "loop-simplifycfg,loop-sink,loop-load-elim,loop-interchange,"
-        "loop-reduce,loop-unroll),"
-        "secshared-metadata,"
-        "function(mpc-loop-vectorize),"
-        "function(instcombine<max-iterations=10;>,dce),"
-        "secshared-metadata,"
-        "vec-mpc-link,"
-        "default<O1>,"
-        "secshared-metadata,"
-        "mpc-remove-ops,dce,"
-        "secshared-metadata,"
-        "mpc-link,"
-        "default<O1>";
-}
-
-bool registerNoLinkLoopFlattenPipeline(StringRef Name, ModulePassManager& MPM, ArrayRef<PassBuilder::PipelineElement>) {
-    if (Name != "no-link-loop-flatten-pipeline")
-        return false;
-
-    PassBuilder LocalPB(/*TM=*/nullptr);
-    LocalPB.registerPipelineParsingCallback(registerModulePasses);
-    LocalPB.registerPipelineParsingCallback(registerFunctionPasses);
-
-    std::string pipeline = buildNoLinkLoopFlattenPipeline();
-    if (auto Err = LocalPB.parsePassPipeline(MPM, pipeline)) {
-        logAllUnhandledErrors(std::move(Err), errs(), "no-link-loop-flatten-pipeline: ");
-        return false;
-    }
-    return true;
-}
-
-bool registerLoopFlattenPipeline(StringRef Name, ModulePassManager& MPM, ArrayRef<PassBuilder::PipelineElement>) {
-    if (Name != "loop-flatten-pipeline")
-        return false;
-
-    PassBuilder LocalPB(/*TM=*/nullptr);
-    LocalPB.registerPipelineParsingCallback(registerModulePasses);
-    LocalPB.registerPipelineParsingCallback(registerFunctionPasses);
-
-    std::string pipeline = buildLoopFlattenPipeline();
-    if (auto Err = LocalPB.parsePassPipeline(MPM, pipeline)) {
-        logAllUnhandledErrors(std::move(Err), errs(), "loop-flatten-pipeline: ");
+    if (auto Err = LocalPB.parsePassPipeline(MPM, *pipeline)) {
+        logAllUnhandledErrors(std::move(Err), errs(), Name + ": ");
         return false;
     }
     return true;
@@ -387,9 +297,6 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
                 });
                 PB.registerPipelineParsingCallback(registerModulePasses);
                 PB.registerPipelineParsingCallback(registerFunctionPasses);
-                PB.registerPipelineParsingCallback(registerSmaugPipeline);
-                PB.registerPipelineParsingCallback(registerNoLinkPipeline);
-                PB.registerPipelineParsingCallback(registerNoLinkLoopFlattenPipeline);
-                PB.registerPipelineParsingCallback(registerLoopFlattenPipeline);
+                PB.registerPipelineParsingCallback(registerNamedPipelines);
             }};
 }
