@@ -81,6 +81,7 @@ add_library(passes MODULE
     ./src/MPCLink.cpp
     ./src/Options.cpp
     ./src/lower/Abi.cpp
+    ./src/lower/BoolNarrowing.cpp
     ./src/lower/Lowering.cpp
     ./src/lower/MPCLower.cpp
     ./src/lower/SecretAnalysis.cpp
