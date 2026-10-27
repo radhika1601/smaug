@@ -14,11 +14,12 @@
 
 using namespace emp;
 
-namespace MPC {
-extern int party;
-}
-
 namespace {
+
+// The protocol, set up by smaug_setup.
+int party_;
+NetIO *io_;
+long andGatesAtReset_ = 0;
 
 [[noreturn]] void fail(const char *what, uint32_t w) {
   fprintf(stderr, "smaug runtime (gc): %s not supported for width %u\n", what,
@@ -403,6 +404,36 @@ void fromBools(uint32_t w, void *plain, const bool *b, uint64_t n) {
 
 extern "C" {
 
+void smaug_setup(int32_t party, int32_t port) {
+  party_ = party;
+  io_ = new NetIO(party == ALICE ? nullptr : "127.0.0.1", port, true);
+  setup_semi_honest(io_, party);
+}
+
+void smaug_setup_stdin(void) {
+  int32_t party, port;
+  printf("party \n");
+  if (scanf("%d", &party) != 1)
+    abort();
+  printf("port \n");
+  if (scanf("%d", &port) != 1)
+    abort();
+  smaug_setup(party, port);
+}
+
+void smaug_finish(void) {
+  finalize_semi_honest();
+  delete io_;
+}
+
+int64_t smaug_and_gates(void) {
+  return CircuitExecution::circ_exec->num_and() - andGatesAtReset_;
+}
+
+void smaug_reset_and_gates(void) {
+  andGatesAtReset_ = CircuitExecution::circ_exec->num_and();
+}
+
 void *smaug_alloc(uint32_t w, uint64_t n) {
   checkWidth(w);
   if (w == 1) {
@@ -428,7 +459,7 @@ void *smaug_elem(void *b, uint32_t w, uint64_t i) {
   return w == 1 ? (void *)(bits(b) + i) : (void *)(ints(b) + i);
 }
 
-int32_t smaug_party(void) { return MPC::party; }
+int32_t smaug_party(void) { return party_; }
 
 void smaug_copy(uint32_t w, void *dst, const void *src, uint64_t n) {
   if (dst == src || n == 0)
@@ -474,9 +505,9 @@ void smaug_import(uint32_t w, void *dst, const void *share, uint64_t n) {
   std::unique_ptr<bool[]> none(new bool[m ? m : 1]());
   std::vector<block> a(m ? m : 1), b(m ? m : 1);
   ProtocolExecution::prot_exec->feed(a.data(), ALICE,
-                                     MPC::party == ALICE ? mine.get() : none.get(), m);
+                                     party_ == ALICE ? mine.get() : none.get(), m);
   ProtocolExecution::prot_exec->feed(b.data(), BOB,
-                                     MPC::party == BOB ? mine.get() : none.get(), m);
+                                     party_ == BOB ? mine.get() : none.get(), m);
   std::vector<block> x(m ? m : 1);
   for (uint64_t k = 0; k < m; ++k)
     x[k] = (Bit(a[k]) ^ Bit(b[k])).bit;

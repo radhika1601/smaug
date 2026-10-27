@@ -7,17 +7,13 @@
 #include <optional>
 
 #include "MPCHierarchical.h"
-#include "MPCLink.h"
 #include "../include/MPCLoopFlatten.h"
 #include "MPCLoopMemAlign.h"
 #include "MPCLoopReconstruct.h"
-#include "MPCRemoveOps.h"
-#include "Options.h"
 #include "Metadata.h"
 #include "MetadataHelper.h"
 #include "ParallelizeReductions.h"
 #include "TopologicalTraversal.h"
-#include "VectorMPCLink.h"
 #include "VectorizeHelper.h"
 #include "Vectorize/LoopVectorize.h"
 #include "lower/MPCLower.h"
@@ -40,18 +36,6 @@ bool registerModulePasses(StringRef Name, ModulePassManager& MPM, ArrayRef<PassB
     }
     if (Name == "topological-traversal") {
         MPM.addPass(createModuleToFunctionPassAdaptor(TopologicalTraversal()));
-        return true;
-    }
-    if (Name == "mpc-remove-ops") {
-        MPM.addPass(MPCRemoveOpsPass());
-        return true;
-    }
-    if (Name == "mpc-link") {
-        MPM.addPass(MPCLinkPass());
-        return true;
-    }
-    if (Name == "vec-mpc-link") {
-        MPM.addPass(VectorMPCLinkPass());
         return true;
     }
     if (Name == "mpc-lower") {
@@ -239,38 +223,25 @@ static std::string buildPrefix(bool flatten, bool vectorize) {
     return p;
 }
 
-// The stage that lowers the code to MPC runtime calls, chosen by
-// --mpc-lowering.
-static std::string buildLinkStage() {
-    if (Lowering == MPCLowering::New)
-        return "mpc-narrow-bool,mpc-lower,default<O1>";
-    // No optimization between vec-mpc-link and mpc-link. vec-mpc-link moves
-    // vector loops onto new MPC buffers, and the scalar loops that fill those
-    // buffers still write the originals until mpc-link redirects them. An
-    // optimization pass in between deletes those scalar loops as dead stores.
-    return "vec-mpc-link,"
-           "secshared-metadata,"
-           "mpc-remove-ops,dce,"
-           "secshared-metadata,"
-           "mpc-link,"
-           "default<O1>";
-}
+// The stage that lowers the code to MPC runtime calls. The result is the
+// same for both backends; the runtime library linked in chooses one.
+static const std::string LinkStage = "mpc-narrow-bool,mpc-lower,default<O1>";
 
 static std::optional<std::string> namedPipeline(StringRef Name) {
     if (Name == "smaug-pipeline")
-        return buildPrefix(false, true) + "," + buildLinkStage();
+        return buildPrefix(false, true) + "," + LinkStage;
     if (Name == "smaug-pipeline-novec")
-        return buildPrefix(false, false) + "," + buildLinkStage();
+        return buildPrefix(false, false) + "," + LinkStage;
     if (Name == "loop-flatten-pipeline")
-        return buildPrefix(true, true) + "," + buildLinkStage();
+        return buildPrefix(true, true) + "," + LinkStage;
     if (Name == "loop-flatten-pipeline-novec")
-        return buildPrefix(true, false) + "," + buildLinkStage();
+        return buildPrefix(true, false) + "," + LinkStage;
     if (Name == "no-link-pipeline")
         return buildPrefix(false, true);
     if (Name == "no-link-loop-flatten-pipeline")
         return buildPrefix(true, true);
     if (Name == "smaug-link")
-        return buildLinkStage();
+        return LinkStage;
     return std::nullopt;
 }
 

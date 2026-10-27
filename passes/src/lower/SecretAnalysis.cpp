@@ -80,6 +80,9 @@ void SecretAnalysis::run(Function &F, const FunctionSpec &Spec) {
       } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
         if (isSecret(SI->getValueOperand()))
           Changed |= markRoot(SI->getPointerOperand());
+      } else if (auto *MS = dyn_cast<MemSetInst>(&I)) {
+        if (isSecret(MS->getValue()))
+          Changed |= markRoot(MS->getRawDest());
       } else if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
         Value *Src = rootOf(MT->getRawSource());
         if (Src && isSecretRoot(Src))

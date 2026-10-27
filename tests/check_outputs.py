@@ -78,20 +78,18 @@ SPEC = {
 
 # Same pipelines as the run targets in benchmarks/Makefile, plus the
 # pipelines without mpc-loop-vectorize:
-# name: (gc mode, runtime library, opt -passes stages).
+# name: (runtime library, opt -passes stages). The library chooses the
+# backend: gc-opt for garbled circuits, mpc for GMW.
 PIPELINES = {
-    'gc': ('true', 'gc-opt', ['smaug-pipeline']),
-    'no-gc': ('false', 'mpc', ['smaug-pipeline']),
-    'loop-flatten': ('true', 'gc-opt',
-                     ['no-link-loop-flatten-pipeline', 'smaug-link']),
-    'loop-flatten-no-gc': ('false', 'mpc',
-                           ['no-link-loop-flatten-pipeline', 'smaug-link']),
-    'gc-novec': ('true', 'gc-opt', ['smaug-pipeline-novec']),
-    'no-gc-novec': ('false', 'mpc', ['smaug-pipeline-novec']),
+    'gc': ('gc-opt', ['smaug-pipeline']),
+    'no-gc': ('mpc', ['smaug-pipeline']),
+    'loop-flatten': ('gc-opt', ['no-link-loop-flatten-pipeline', 'smaug-link']),
+    'loop-flatten-no-gc': ('mpc', ['no-link-loop-flatten-pipeline',
+                                   'smaug-link']),
+    'gc-novec': ('gc-opt', ['smaug-pipeline-novec']),
+    'no-gc-novec': ('mpc', ['smaug-pipeline-novec']),
 }
 DEFAULT_PIPELINES = 'gc,no-gc,loop-flatten,loop-flatten-no-gc'
-# Lowerings selectable with --mpc-lowering (see passes/src/Options.cpp).
-LOWERINGS = ('legacy', 'new')
 
 
 OPS = f'{HERE}/ops'
@@ -332,18 +330,17 @@ def run(cmd):
     return sp.run(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
 
 
-def build(tc, name, src, metadata, pipe, lowering, link=True):
+def build(tc, name, src, metadata, pipe, link=True):
     """Returns (executable, None) or (None, (status, message)), where status
     is 'unsupported' for an mpc-lower diagnostic and 'build' otherwise.
     Without link, returns the transformed .ll instead of an executable."""
-    gc, lib, stages = PIPELINES[pipe]
-    d = f'{BUILD}/{lowering}/{pipe}'
+    lib, stages = PIPELINES[pipe]
+    d = f'{BUILD}/{pipe}'
     os.makedirs(d, exist_ok=True)
     stem = test_id(name)
     ll, exe = f'{d}/{stem}.ll', f'{d}/{stem}'
     plugin = ['--interleave-loops=false', f'-load-pass-plugin={tc["plugin"]}',
-              f'--metadata-path={metadata}', f'--gc={gc}',
-              f'--mpc-lowering={lowering}']
+              f'--metadata-path={metadata}']
     steps = [[tc['clang'], f'-I{tc["prefix"]}/include', f'-I{HERE}/harness',
               '-O0', '-Xclang', '-disable-O0-optnone', '-S', '-emit-llvm',
               '-std=c++17'] + tc['sysroot'] + [src, '-o', ll],
@@ -515,8 +512,6 @@ def main():
                          '(default: all tests in the suites)')
     ap.add_argument('--pipelines', default=DEFAULT_PIPELINES,
                     help='comma-separated pipelines: ' + ', '.join(PIPELINES))
-    ap.add_argument('--lowering', default='legacy',
-                    help='comma-separated lowerings: ' + ', '.join(LOWERINGS))
     ap.add_argument('--save-gates', default='',
                     help='write the gate count of each passing test and '
                          'pipeline (first trial) to this JSON file')
@@ -535,16 +530,12 @@ def main():
     table = tests(a.suites.split(','))
     names = [x for x in a.tests.split(',') if x] or list(table)
     pipes = [x for x in a.pipelines.split(',') if x]
-    lowerings = [x for x in a.lowering.split(',') if x]
     for x in names:
         if x not in table:
             sys.exit(f'unknown test {x}')
     for x in pipes:
         if x not in PIPELINES:
             sys.exit(f'unknown pipeline {x}')
-    for x in lowerings:
-        if x not in LOWERINGS:
-            sys.exit(f'unknown lowering {x}')
 
     tc = toolchain()
     os.makedirs(BUILD, exist_ok=True)
@@ -565,12 +556,10 @@ def main():
             next_port[0] = port + 4
             return port
 
-    def record(lowering, name, pipe, trial_name, status, detail, gates):
-        prefix = f'{lowering} ' if len(lowerings) > 1 else ''
-        label = f'{prefix}{name} {pipe}' + (f' {trial_name}' if trial_name
-                                            else '')
+    def record(name, pipe, trial_name, status, detail, gates):
+        label = f'{name} {pipe}' + (f' {trial_name}' if trial_name else '')
         with lock:
-            results.append({'lowering': lowering, 'test': name,
+            results.append({'test': name,
                             'pipeline': pipe, 'trial': trial_name,
                             'status': status, 'detail': detail,
                             'gates': gates})
@@ -602,24 +591,24 @@ def main():
     # Phase 1: every build. A test of a combined suite builds to a .ll.
     built = {}
 
-    def build_unit(name, lowering, pipe):
+    def build_unit(name, pipe):
         src, meta, _ = prepare(name)
-        path, err = build(tc, name, src, meta, pipe, lowering,
+        path, err = build(tc, name, src, meta, pipe,
                           link=not table[name][5])
         if err:
-            record(lowering, name, pipe, '', err[0], err[1], None)
+            record(name, pipe, '', err[0], err[1], None)
         with lock:
-            built[(name, lowering, pipe)] = path
+            built[(name, pipe)] = path
 
     # Phase 2: the runs.
-    def run_standalone(name, lowering, pipe):
-        exe = built[(name, lowering, pipe)]
+    def run_standalone(name, pipe):
+        exe = built[(name, pipe)]
         if not exe:
             return
-        d = f'{BUILD}/run/{lowering}/{pipe}/{test_id(name)}'
+        d = f'{BUILD}/run/{pipe}/{test_id(name)}'
         res = trials(exe, prepare(name)[2], d, a.n, trial_names, take_port())
         for t in trial_names:
-            record(lowering, name, pipe, t, *res[t])
+            record(name, pipe, t, *res[t])
 
     natives, native_lock = {}, threading.Lock()
 
@@ -631,21 +620,21 @@ def main():
                     tc, suite, ns, [prepare(n)[2] for n in ns])
             return natives[suite]
 
-    def run_group(suite, lowering, pipe, group, tag):
+    def run_group(suite, pipe, group, tag):
         """Links the tests in group into one program and runs them. Returns
         {name: {trial: result}}, or None if linking failed or the program
         crashed or timed out, so that the caller can narrow it down."""
-        lib = PIPELINES[pipe][1]
-        d = f'{BUILD}/{lowering}/{pipe}'
+        lib = PIPELINES[pipe][0]
+        d = f'{BUILD}/{pipe}'
         ids = [test_id(n) for n in group]
         exe = f'{d}/{suite}_{tag}'
         driver = driver_source(ids, f'{exe}_driver.cpp')
         r = run(link_command(tc, lib, [driver] + [
-            built[(n, lowering, pipe)] for n in group], exe))
+            built[(n, pipe)] for n in group], exe))
         if r.returncode:
             return None, build_error(link_command(tc, lib, [], exe), r)
         res = trials(exe, native_suite(suite),
-                     f'{BUILD}/run/{lowering}/{pipe}/{suite}_{tag}', a.n,
+                     f'{BUILD}/run/{pipe}/{suite}_{tag}', a.n,
                      trial_names, take_port(), ids)
         if any(v[0] in ('crash', 'timeout') for v in res.values()):
             return None, (next(v for v in res.values()
@@ -653,58 +642,51 @@ def main():
         return {n: {t: res[f'{test_id(n)}.{t}'] for t in trial_names}
                 for n in group}, None
 
-    def run_combined(suite, lowering, pipe):
-        group = [n for n in suites[suite] if built[(n, lowering, pipe)]]
+    def run_combined(suite, pipe):
+        group = [n for n in suites[suite] if built[(n, pipe)]]
         if not group:
             return
-        out, _ = run_group(suite, lowering, pipe, group, 'combined')
+        out, _ = run_group(suite, pipe, group, 'combined')
         if out is None:
             # Run each test on its own to find the one that failed.
             out = {}
             for n in group:
-                one, err = run_group(suite, lowering, pipe, [n],
+                one, err = run_group(suite, pipe, [n],
                                      'single_' + test_id(n))
                 if one is None:
                     for t in trial_names:
-                        record(lowering, n, pipe, t, err[0], err[1], None)
+                        record(n, pipe, t, err[0], err[1], None)
                 else:
                     out.update(one)
         for n, res in out.items():
             for t in trial_names:
-                record(lowering, n, pipe, t, *res[t])
+                record(n, pipe, t, *res[t])
 
     with ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
-        for f in [pool.submit(build_unit, n, l, p)
-                  for n in names for l in lowerings for p in pipes]:
+        for f in [pool.submit(build_unit, n, p) for n in names for p in pipes]:
             f.result()  # re-raise errors from the workers
-        runs = [pool.submit(run_standalone, n, l, p)
-                for n in standalone for l in lowerings for p in pipes]
-        runs += [pool.submit(run_combined, su, l, p)
-                 for su in suites for l in lowerings for p in pipes]
+        runs = [pool.submit(run_standalone, n, p)
+                for n in standalone for p in pipes]
+        runs += [pool.submit(run_combined, su, p)
+                 for su in suites for p in pipes]
         for f in runs:
             f.result()
-    results.sort(key=lambda r: (r['lowering'], r['test'], r['pipeline'],
-                                r['trial']))
+    results.sort(key=lambda r: (r['test'], r['pipeline'], r['trial']))
 
     with open(f'{BUILD}/results.json', 'w') as f:
         json.dump(results, f, indent=1)
     if a.save_gates:
-        gates = {}
-        for r in results:
-            if r['status'] == 'pass' and r['trial'] == f'z{a.seeds.split(",")[0]}':
-                gates.setdefault(r['lowering'], {})[
-                    f'{r["test"]} {r["pipeline"]}'] = r['gates']
+        first = f'z{a.seeds.split(",")[0]}'
+        gates = {f'{r["test"]} {r["pipeline"]}': r['gates'] for r in results
+                 if r['status'] == 'pass' and r['trial'] == first}
         with open(a.save_gates, 'w') as f:
             json.dump(gates, f, indent=1, sort_keys=True)
 
+    counts = {}
+    for r in results:
+        counts[r['status']] = counts.get(r['status'], 0) + 1
     print()
-    for lowering in lowerings:
-        counts = {}
-        for r in results:
-            if r['lowering'] == lowering:
-                counts[r['status']] = counts.get(r['status'], 0) + 1
-        summary = ', '.join(f'{v} {k}' for k, v in sorted(counts.items()))
-        print(f'Results ({lowering}): {summary}')
+    print('Results: ' + ', '.join(f'{v} {k}' for k, v in sorted(counts.items())))
     sys.exit(0 if all(r['status'] == 'pass' for r in results) else 1)
 
 

@@ -78,8 +78,6 @@ add_library(passes MODULE
     ./src/Metadata.cpp
     ./src/MetadataHelper.cpp
     ./src/Passes.cpp
-    ./src/MPCLink.cpp
-    ./src/Options.cpp
     ./src/lower/Abi.cpp
     ./src/lower/BoolNarrowing.cpp
     ./src/lower/Lowering.cpp
@@ -90,9 +88,7 @@ add_library(passes MODULE
     ./src/MPCLoopFlatten.cpp
     ./src/MPCLoopMemAlign.cpp
     ./src/MPCLoopReconstruct.cpp
-    ./src/MPCRemoveOps.cpp
     ./src/ParallelizeReductions.cpp
-    ./src/VectorMPCLink.cpp
     ./src/VectorizeHelper.cpp
     ./src/Vectorize/LoopVectorize.cpp
     ./src/Vectorize/LoopVectorizationLegality.cpp

@@ -91,8 +91,6 @@ void SecSharedMetadataPass::removeMetadata(Function &F) {
           continue;
         if (name.find("calloc") != std::string::npos)
           continue;
-        if(name.find("_ZN3MPC9create") != std::string::npos)
-          continue;
         if (name.find("llvm.fmuladd") != std::string::npos) {
           Builder.SetInsertPoint(&I);
           Value *mul =
@@ -138,7 +136,7 @@ void SecSharedMetadataPass::runImpl(Function &F, SmallVector<Argument *> &Args,
       if (I.hasMetadata("secret_shared")) {
         if (CallInst *ci = dyn_cast<CallInst>(&I)) {
           auto name = ci->getCalledFunction()->getName();
-          if (name.contains("malloc") || name.contains("_ZN3MPC9create"))
+          if (name.contains("malloc"))
             setSecretShared(&I, F.getContext(), PubOutputs);
         }
         if (isa<AllocaInst>(I)) {

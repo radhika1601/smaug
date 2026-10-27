@@ -32,24 +32,25 @@ bool callsPrefix(Function &F, StringRef Prefix) {
 }
 
 // main must set up the protocol before anything is computed and finish it at
-// the end. Benchmarks call MPC::setup themselves; add the calls if missing.
-void addSetupFinish(Module &M) {
+// the end. Programs normally call MPC::setup and MPC::finish (mpc/mpc.h),
+// which wrap smaug_setup and smaug_finish; add the calls if they are missing.
+void addSetupFinish(Module &M, Abi &A) {
   Function *Main = M.getFunction("main");
   if (!Main || Main->isDeclaration())
     return;
-  LLVMContext &Ctx = M.getContext();
-  FunctionType *VoidFn = FunctionType::get(Type::getVoidTy(Ctx), false);
-  if (!callsPrefix(*Main, "_ZN3MPC5setup")) {
+  if (!callsPrefix(*Main, "smaug_setup") &&
+      !callsPrefix(*Main, "_ZN3MPC5setup")) {
     IRBuilder<> B(&*Main->getEntryBlock().getFirstInsertionPt());
-    B.CreateCall(M.getOrInsertFunction("_ZN3MPC5setupEv", VoidFn));
+    B.CreateCall(A.get("smaug_setup_stdin"));
   }
-  if (!callsPrefix(*Main, "_ZN3MPC6finish")) {
+  if (!callsPrefix(*Main, "smaug_finish") &&
+      !callsPrefix(*Main, "_ZN3MPC6finish")) {
     SmallVector<ReturnInst *> Rets;
     for (BasicBlock &BB : *Main)
       if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
         Rets.push_back(RI);
     for (ReturnInst *RI : Rets)
-      IRBuilder<>(RI).CreateCall(M.getOrInsertFunction("_ZN3MPC6finishEv", VoidFn));
+      IRBuilder<>(RI).CreateCall(A.get("smaug_finish"));
   }
 }
 
@@ -144,82 +145,13 @@ std::string location(const Instruction *I) {
 
 } // namespace
 
-// mpc-loop-reconstruct fills the storage of flattened phis with a call to the
-// legacy runtime: MPC::store(dst, src, n, elemBytes, shared, consecutive)
-// writes *src to dst[0..n). Expand it into an IR loop so that the fill is
-// ordinary memory traffic. The shared flag describes the legacy runtime's
-// representation and has no meaning before lowering.
-void expandLegacyFill(Module &M) {
-  Function *Fill = M.getFunction("_ZN3MPC5storeEPvS0_iibb");
-  if (!Fill)
-    return;
-  LLVMContext &Ctx = M.getContext();
-  for (User *U : make_early_inc_range(Fill->users())) {
-    auto *CI = dyn_cast<CallInst>(U);
-    if (!CI || CI->getCalledFunction() != Fill)
-      report_fatal_error("mpc-lower: unexpected use of the legacy fill call",
-                         false);
-    auto *ElemBytes = dyn_cast<ConstantInt>(CI->getArgOperand(3));
-    auto *Consecutive = dyn_cast<ConstantInt>(CI->getArgOperand(5));
-    if (!ElemBytes || !Consecutive || !Consecutive->isZero())
-      report_fatal_error("mpc-lower: legacy fill call with a non-constant "
-                         "element size or consecutive values",
-                         false);
-    Type *T = IntegerType::get(Ctx, 8 * ElemBytes->getZExtValue());
-    Value *Dst = CI->getArgOperand(0), *Src = CI->getArgOperand(1);
-
-    // src is a one-element alloca written once just before the call. Use the
-    // stored value directly.
-    Value *V = nullptr;
-    auto *Slot = dyn_cast<AllocaInst>(Src);
-    StoreInst *SlotStore = nullptr;
-    if (Slot && Slot->hasNUses(2))
-      for (User *SU : Slot->users())
-        if (auto *SI = dyn_cast<StoreInst>(SU))
-          if (SI->getPointerOperand() == Slot &&
-              SI->getValueOperand()->getType() == T &&
-              SI->getParent() == CI->getParent() && SI->comesBefore(CI))
-            SlotStore = SI;
-    IRBuilder<> B(CI);
-    if (SlotStore)
-      V = SlotStore->getValueOperand();
-    else
-      V = B.CreateLoad(T, Src);
-    Value *N = B.CreateZExt(CI->getArgOperand(2), B.getInt64Ty());
-
-    BasicBlock *Before = CI->getParent();
-    BasicBlock *After = SplitBlock(Before, CI);
-    BasicBlock *Loop =
-        BasicBlock::Create(Ctx, "smaug.fill", Before->getParent(), After);
-    Before->getTerminator()->eraseFromParent();
-    B.SetInsertPoint(Before);
-    B.CreateCondBr(B.CreateICmpSGT(N, B.getInt64(0)), Loop, After);
-    B.SetInsertPoint(Loop);
-    PHINode *I = B.CreatePHI(B.getInt64Ty(), 2);
-    I->addIncoming(B.getInt64(0), Before);
-    B.CreateStore(V, B.CreateGEP(T, Dst, I));
-    Value *Next = B.CreateAdd(I, B.getInt64(1));
-    I->addIncoming(Next, Loop);
-    B.CreateCondBr(B.CreateICmpSLT(Next, N), Loop, After);
-
-    CI->eraseFromParent();
-    if (SlotStore) {
-      SlotStore->eraseFromParent();
-      Slot->eraseFromParent();
-    }
-  }
-  Fill->eraseFromParent();
-}
-
 PreservedAnalyses MPCLowerPass::run(Module &M, ModuleAnalysisManager &) {
   Expected<SecretSpec> Spec = SecretSpec::load(MetadataFilePath, M);
   if (!Spec)
     report_fatal_error(Twine("mpc-lower: ") + toString(Spec.takeError()),
                        false);
-  addSetupFinish(M);
-  expandLegacyFill(M);
-
   Abi A(M);
+  addSetupFinish(M, A);
   std::vector<Diagnostic> Diags;
   for (auto &[Fn, FS] : Spec->Funcs) {
     if (!FS.hasSecretArgs())

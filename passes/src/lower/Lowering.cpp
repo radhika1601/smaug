@@ -973,12 +973,37 @@ void FunctionLowering::lowerMemSet(MemSetInst &I) {
   Value *RootV = SA.rootOf(I.getRawDest());
   if (!RootV || !SA.isSecretRoot(RootV))
     return;
-  if (SA.isSecret(I.getValue()))
-    return unsupported(I, "memset with a secret value");
   Root *R = rootFor(I.getRawDest(), I);
   if (!R)
     return;
   IRBuilder<> B(&I);
+  if (SA.isSecret(I.getValue())) {
+    // A secret byte fills a byte buffer, e.g. after loop-idiom turned a
+    // fill loop into a memset. A buffer narrowed by mpc-narrow-bool holds
+    // Bits, and the byte is 0 or 1: fill with its low bit.
+    Value *V = I.getValue(), *Src;
+    if (R->W == 8) {
+      Src = slot(V);
+    } else if (R->W == 1) {
+      Value *Bit;
+      if (match(V, PatternMatch::m_ZExt(PatternMatch::m_Value(Bit))) &&
+          Bit->getType()->isIntegerTy(1) && SA.isSecret(Bit)) {
+        Src = slot(Bit);
+      } else {
+        Src = newSlot(1, "memset.bit");
+        B.CreateCall(A.get("smaug_trunc"), {B.getInt32(1), B.getInt32(8), Src,
+                                             slot(V), B.getInt64(1)});
+      }
+    } else {
+      return unsupported(I, "memset with a secret value into a buffer of "
+                            "i" + Twine(R->W));
+    }
+    B.CreateCall(A.get("smaug_fill"),
+                 {B.getInt32(R->W), elementPtr(*R, I.getRawDest(), B), Src,
+                  B.CreateZExtOrTrunc(I.getLength(), B.getInt64Ty())});
+    Lowered.insert(&I);
+    return;
+  }
   // Every element holds the byte repeated: multiply by 0x0101...01.
   Type *ET = B.getIntNTy(R->W == 1 ? 8 : R->W);
   Value *Byte = B.CreateZExt(I.getValue(), ET);

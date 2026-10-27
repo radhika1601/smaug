@@ -13,7 +13,8 @@
 //   markers, compares and ptrtoint;
 // - it is only accessed as i8 or <vscale x 1 x i8>;
 // - every stored value is 0 or 1 (see isBool);
-// - memset writes 0 or 1, and memcpy partners are narrowed too.
+// - memset writes a value that is 0 or 1, and memcpy partners are narrowed
+//   too.
 //
 // Rewrite: an i8 load becomes zext(load i1) and a store writes the i1 form of
 // its value. Local folds then remove the conversions where the value is used
@@ -211,8 +212,8 @@ private:
         return false;
     }
     for (MemSetInst *MS : U.MemSets) {
-      auto *C = dyn_cast<ConstantInt>(MS->getValue());
-      if (!C || C->getValue().ugt(1))
+      SmallPtrSet<Value *, 16> InProgress;
+      if (!isBool(MS->getValue(), InProgress))
         return false;
     }
     for (MemTransferInst *MT : U.Copies) {
@@ -434,7 +435,6 @@ PreservedAnalyses MPCNarrowBoolPass::run(Module &M, ModuleAnalysisManager &) {
   if (!Spec)
     report_fatal_error(Twine("mpc-narrow-bool: ") + toString(Spec.takeError()),
                        false);
-  expandLegacyFill(M);
   bool Changed = false;
   for (auto &[Fn, FS] : Spec->Funcs)
     if (FS.hasSecretArgs())

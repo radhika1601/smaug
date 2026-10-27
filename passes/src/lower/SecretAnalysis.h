@@ -9,7 +9,8 @@
 // Rules, run to a fixpoint:
 // - Secret arguments from the specification are secret scalars or roots.
 // - A load from a secret root, or through a secret offset, is secret.
-// - Storing a secret value makes the pointer's root secret.
+// - Storing a secret value, or a memset with one, makes the pointer's root
+//   secret.
 // - memcpy/memmove from a secret root makes the destination root secret.
 // - Any other non-pointer value is secret if a non-pointer operand is.
 // - A GEP has a secret offset if an index is secret or its base has one.

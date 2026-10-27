@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
   int32_t *resY1 = (int32_t *)malloc(sizeof(int32_t) * N);
   memset(resX1, 0, N * sizeof(int32_t));
   memset(resY1, 0, N * sizeof(int32_t));
-  if (MPC::party == 1) {
+  if (MPC::party() == 1) {
     for (int32_t i = 0; i < N; ++i) {
       X[i] = 50 - (rand() % 100);
       Y[i] = 50 - (rand() % 100);

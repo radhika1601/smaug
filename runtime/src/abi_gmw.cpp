@@ -4,15 +4,16 @@
 //
 // Work is done on 64-bit share values. Linear operations (xor, constants,
 // public shifts, casts) are local; AND gates and the circuits in
-// MPC_CIRCUIT_DIR run through mpc.cpp on bit-sliced copies. The emp-aby
-// headers define non-inline functions, so only mpc.cpp includes them.
 
-#include "emp-tool/io/net_io_channel.h"
+#include "emp-aby/mp-circuit.hpp"
+#include "emp-aby/simd_interface/simd_exec.h"
+#include "emp-tool/utils/utils.h"
 #include "mpc/smaug_abi.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <string>
@@ -24,13 +25,27 @@
 
 using namespace emp;
 
-namespace MPC {
-extern int party;
-extern std::vector<NetIO *> ios;
-// Defined in mpc.cpp.
-void abiAndGate(bool *out, bool *a, bool *b, size_t n);
-void abiRunCircuit(const char *path, bool *out, bool *in, unsigned num);
-} // namespace MPC
+namespace {
+
+// The protocol, set up by smaug_setup.
+int party_;
+std::vector<NetIO *> ios_;
+SIMDCircExec<NetIO> *simd_;
+
+void andGate(bool *out, bool *a, bool *b, size_t n) {
+  simd_->and_gate(out, a, b, n);
+}
+
+void runCircuit(const char *path, bool *out, bool *in, unsigned num) {
+  static std::map<std::string, std::unique_ptr<Circuit<SIMDCircExec<NetIO>>>>
+      cache;
+  auto &c = cache[path];
+  if (!c)
+    c.reset(new Circuit<SIMDCircExec<NetIO>>(path, party_, simd_));
+  c->compute<NetIO>(out, in, num, true);
+}
+
+} // namespace
 
 namespace {
 
@@ -49,7 +64,7 @@ void checkWidth(uint32_t w) {
 
 uint32_t storageBytes(uint32_t w) { return w == 1 ? 1 : w / 8; }
 uint64_t mask(uint32_t w) { return w == 64 ? ~0ull : ((1ull << w) - 1); }
-bool isAlice() { return MPC::party == 1; }
+bool isAlice() { return party_ == 1; }
 
 // A public constant as a share: party 1 holds it, party 2 holds 0.
 uint64_t aliceOnly(uint64_t v) { return isAlice() ? v : 0; }
@@ -147,7 +162,7 @@ Vals andv(const Vals &a, const Vals &b, uint32_t w) {
     return Vals(a.size(), 0);
   auto x = slice(a, w), y = slice(b, w);
   std::unique_ptr<bool[]> o(new bool[m]);
-  MPC::abiAndGate(o.get(), x.get(), y.get(), m);
+  andGate(o.get(), x.get(), y.get(), m);
   return unslice(o.get(), a.size(), w);
 }
 
@@ -200,7 +215,7 @@ Vals runCircuit(const std::string &name, uint32_t wi, uint32_t wo,
     abort();
   }
   std::unique_ptr<bool[]> out(new bool[n * wo]);
-  MPC::abiRunCircuit(circuitPath(name).c_str(), out.get(), in.get(), n);
+  runCircuit(circuitPath(name).c_str(), out.get(), in.get(), n);
   return unslice(out.get(), n, wo);
 }
 
@@ -493,6 +508,41 @@ Vals fcmpv(uint32_t pred, const Vals &a, const Vals &b) {
 
 extern "C" {
 
+void smaug_setup(int32_t party, int32_t port) {
+  party_ = party;
+  int threads = 4;
+  for (int i = 0; i < threads; ++i)
+    ios_.push_back(
+        new NetIO(party == ALICE ? nullptr : "127.0.0.1", port, true));
+  auto start = clock_start();
+  simd_ = new SIMDCircExec<NetIO>(party, threads, ios_.data());
+  std::cout << "simd circ exec " << time_from(start) / 1000000 << " "
+            << simd_->num_block_triples_pool * 128 << " \n";
+}
+
+void smaug_setup_stdin(void) {
+  int32_t party, port;
+  std::cout << "party \n";
+  std::cin >> party;
+  std::cout << "port \n";
+  std::cin >> port;
+  smaug_setup(party, port);
+}
+
+void smaug_finish(void) {
+  delete simd_;
+  for (auto io : ios_)
+    delete io;
+  ios_.clear();
+}
+
+int64_t smaug_and_gates(void) { return simd_->num_and_gates; }
+
+void smaug_reset_and_gates(void) {
+  simd_->num_and_gates = 0;
+  simd_->depth = 0;
+}
+
 void *smaug_alloc(uint32_t w, uint64_t n) {
   checkWidth(w);
   return calloc(n ? n : 1, storageBytes(w));
@@ -504,7 +554,7 @@ void *smaug_elem(void *b, uint32_t w, uint64_t i) {
   return (uint8_t *)b + i * storageBytes(w);
 }
 
-int32_t smaug_party(void) { return MPC::party; }
+int32_t smaug_party(void) { return party_; }
 
 void smaug_copy(uint32_t w, void *dst, const void *src, uint64_t n) {
   memmove(dst, src, n * storageBytes(w));
@@ -539,7 +589,7 @@ void smaug_share_public(uint32_t w, void *dst, const void *pub,
 void smaug_reveal(uint32_t w, void *pub, const void *src, uint64_t n) {
   checkWidth(w);
   Vals mine = load(src, w, n), theirs(n);
-  NetIO *io = MPC::ios[0];
+  NetIO *io = ios_[0];
   if (isAlice()) {
     io->send_data(mine.data(), n * 8);
     io->flush();
