@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
   int32_t *resclusterY = (int32_t *)malloc(sizeof(int32_t) * N);
   memset(resclusterY, 0, sizeof(int32_t) * N);
 
-  if (MPC::party == 1) {
+  if (MPC::party() == 1) {
     for (int32_t i = 0; i < L; ++i) {
       X[i] = rand() % 1000;
       Y[i] = rand() % 1000;

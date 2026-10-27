@@ -23,6 +23,17 @@
 #error "define SMAUG_FN before including smaug_abi.def"
 #endif
 
+// The protocol. smaug_setup connects the two parties: party 1 listens on
+// port, party 2 connects to it on 127.0.0.1. smaug_setup_stdin reads the
+// party and the port from standard input; mpc-lower calls it from a main
+// that does not set up the protocol itself. smaug_and_gates counts the AND
+// gates since smaug_reset_and_gates.
+SMAUG_FN(void, smaug_setup, (int32_t party, int32_t port), "v:i,i")
+SMAUG_FN(void, smaug_setup_stdin, (void), "v:")
+SMAUG_FN(void, smaug_finish, (void), "v:")
+SMAUG_FN(int64_t, smaug_and_gates, (void), "l:")
+SMAUG_FN(void, smaug_reset_and_gates, (void), "v:")
+
 // Buffers.
 SMAUG_FN(void *, smaug_alloc, (uint32_t w, uint64_t n), "p:i,l")
 SMAUG_FN(void, smaug_free, (void *b, uint32_t w, uint64_t n), "v:p,i,l")

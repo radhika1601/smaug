@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
     int *data = (int *)calloc(N, sizeof(int));
 
     // Party 1 provides input
-    if (MPC::party == 1) {
+    if (MPC::party() == 1) {
         for (int i = 0; i < N; i++)
             data[i] = rand() % 100;
     }
@@ -84,7 +84,6 @@ $LLVM_PREFIX/bin/opt --interleave-loops=false \
     -load-pass-plugin=passes/build/libpasses.so \
     -passes=smaug-pipeline \
     --metadata-path=my_program.ll.json \
-    --gc=true \
     my_program.ll -o my_program.ll -S
 
 # Link against MPC runtime
@@ -111,13 +110,14 @@ Arguments: `<party_id> <port> <input_size>`
 
 ## Pipeline Variants
 
-| Pipeline | Flag | Backend | Description |
-|----------|------|---------|-------------|
-| `smaug-pipeline` | `--gc=true` | Yao (garbled circuits) | Default, optimized for boolean circuits |
-| `smaug-pipeline` | `--gc=false` | GMW | Boolean GMW  backend |
-| `loop-flatten-pipeline` | `--gc=true` | Yao | Additional loop flattening optimization |
-| `loop-flatten-pipeline` | `--gc=false` | GMW | loop flattening with GMW backend |
-| `no-link-pipeline` | `--gc=true` | - | Transform only, no MPC linking (for debugging) |
+| Pipeline | Description |
+|----------|-------------|
+| `smaug-pipeline` | Default |
+| `loop-flatten-pipeline` | Also flattens nested loops |
+| `smaug-pipeline-novec`, `loop-flatten-pipeline-novec` | The same without `mpc-loop-vectorize` |
+| `no-link-pipeline`, `no-link-loop-flatten-pipeline` | Transform only, without lowering to MPC calls (for debugging) |
+
+Every pipeline ends by lowering to the runtime ABI in `runtime/mpc/smaug_abi.def`. The output is the same for both backends. The library it is linked against chooses the backend: `-lgc-opt` for Yao garbled circuits, `-lmpc` for GMW.
 
 ## Metadata Format
 

@@ -77,7 +77,7 @@ public:
       auto *node = MDNode::get(F->getContext(), MDStr);
       ptrInst->setMetadata("secret_shared", node);
     }
-    // Attach element type metadata so downstream passes (VecMPCLink) can
+    // Attach element type metadata so downstream passes can
     // determine the buffer type without user traversal.
     Type *scalarType = type->getScalarType();
     if (auto *intTy = dyn_cast<IntegerType>(scalarType)) {

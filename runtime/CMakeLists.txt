@@ -22,16 +22,10 @@ find_package(emp-aby REQUIRED)
 include_directories(${EMP-ABY_INCLUDE_DIRS})
 
 add_library(mpc SHARED
-    ./src/mpc.cpp
     ./src/abi_gmw.cpp
 )
 
-add_library(gc SHARED
-    ./src/gc.cpp
-)
-
 add_library(gc-opt SHARED
-    ./src/gc-opt.cpp
     ./src/abi_gc.cpp
 )
 
@@ -39,7 +33,6 @@ target_compile_definitions(mpc PRIVATE
     MPC_CIRCUIT_DIR="${CMAKE_INSTALL_PREFIX}/include/mpc/circuits/")
 
 target_link_libraries(mpc PRIVATE OpenSSL::SSL OpenSSL::Crypto ${EMP-TOOL_LIBRARY})
-target_link_libraries(gc PRIVATE OpenSSL::SSL OpenSSL::Crypto ${EMP-TOOL_LIBRARY})
 target_link_libraries(gc-opt PRIVATE OpenSSL::SSL OpenSSL::Crypto ${EMP-TOOL_LIBRARY})
 
 # Writes the udiv/urem/srem circuits into mpc/circuits (run by hand; the
@@ -60,13 +53,12 @@ foreach(rt mpc gc-opt)
 endforeach()
 
 # Installed libraries find each other and emp-tool through the install prefix.
-set_target_properties(mpc gc gc-opt PROPERTIES
+set_target_properties(mpc gc-opt PROPERTIES
     INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib"
     INSTALL_NAME_DIR "${CMAKE_INSTALL_PREFIX}/lib")
 
 # Installation
 install(DIRECTORY ./mpc/ DESTINATION include/mpc)
 install(TARGETS mpc DESTINATION lib)
-install(TARGETS gc DESTINATION lib)
 install(TARGETS gc-opt DESTINATION lib)
 

@@ -383,104 +383,101 @@ bool MPCLoopReconstructPass::processLoop(Loop *L) {
 
       MDNode *secret = originalPhi->getMetadata("secret_shared");
       Value *storePtr = innerPhiStorePtrs[originalPhi];
-      // Set when the phi's buffer is initialized element by element before
-      // the loop, so the fill below is not needed.
-      bool initialized = false;
-      auto *initInst = dyn_cast<Instruction>(innerPhi.second);
-      if (initInst && L->contains(initInst)) {
-        // The initial value depends on the outer index, which is now
-        // `induction`.
-        LoadInst *load = dyn_cast<LoadInst>(initInst);
-        auto *gep = load ? dyn_cast<GetElementPtrInst>(load->getPointerOperand())
-                         : nullptr;
-        bool plainLoad = gep && gep->getNumIndices() == 1 &&
-                         gep->getOperand(1) == induction &&
-                         gep->getSourceElementType() == load->getType();
-        // The initial value is the phi's own buffer at [induction], so the
-        // buffer already holds the running value. Use the load directly.
-        if (isOwnBufferLoad(initInst, storePtr, induction)) {
-          auto user =
-              dyn_cast<Instruction>(originalPhi->getUniqueUndroppableUser());
-          user->replaceAllUsesWith(load);
-          user->eraseFromParent();
-          originalPhi->eraseFromParent();
-          continue;
-        }
-        if (plainLoad && load->getType() == type) {
-          // The initial values come from another buffer with the same
-          // indexing and type: copy it.
-          Builder.SetInsertPoint(preheader->getTerminator());
-          const DataLayout &DL =
-              header->getParent()->getParent()->getDataLayout();
-          Value *count =
-              Builder.CreateZExtOrTrunc(outerCount, Builder.getInt64Ty());
-          CallInst *copy = Builder.CreateMemCpy(
-              storePtr, DL.getABITypeAlign(type), gep->getPointerOperand(),
-              DL.getABITypeAlign(type),
-              Builder.CreateMul(count,
-                                Builder.getInt64(DL.getTypeAllocSize(type))));
-          if (secret)
-            copy->setMetadata("secret_shared", secret);
-        } else {
-          // Compute each initial value in a loop over the outer index before
-          // the reconstructed loop: the instructions it is computed from are
-          // cloned with `induction` replaced by the counter, and the result,
-          // widened for a bool phi, is stored to the phi's buffer.
-          SmallVector<Instruction *> chain;
-          SmallPtrSet<Instruction *, 8> seen;
+      Value *init = innerPhi.second;
+      auto *initInst = dyn_cast<Instruction>(init);
+      bool inLoop = initInst && L->contains(initInst);
+      // The initial value is the phi's own buffer at [induction], so the
+      // buffer already holds the running value. Use the load directly.
+      if (inLoop && isOwnBufferLoad(initInst, storePtr, induction)) {
+        auto user =
+            dyn_cast<Instruction>(originalPhi->getUniqueUndroppableUser());
+        user->replaceAllUsesWith(initInst);
+        user->eraseFromParent();
+        originalPhi->eraseFromParent();
+        continue;
+      }
+
+      // Write the initial values to the phi's buffer before the loop. In the
+      // loop, the phi reads its buffer at the outer index and its update is
+      // stored back.
+      auto *load = inLoop ? dyn_cast<LoadInst>(initInst) : nullptr;
+      auto *gep = load ? dyn_cast<GetElementPtrInst>(load->getPointerOperand())
+                       : nullptr;
+      if (gep && gep->getNumIndices() == 1 && gep->getOperand(1) == induction &&
+          gep->getSourceElementType() == load->getType() &&
+          load->getType() == type) {
+        // Another buffer with the same indexing and type: copy it.
+        Builder.SetInsertPoint(preheader->getTerminator());
+        const DataLayout &DL =
+            header->getParent()->getParent()->getDataLayout();
+        Value *count =
+            Builder.CreateZExtOrTrunc(outerCount, Builder.getInt64Ty());
+        CallInst *copy = Builder.CreateMemCpy(
+            storePtr, DL.getABITypeAlign(type), gep->getPointerOperand(),
+            DL.getABITypeAlign(type),
+            Builder.CreateMul(count,
+                              Builder.getInt64(DL.getTypeAllocSize(type))));
+        if (secret)
+          copy->setMetadata("secret_shared", secret);
+      } else {
+        // Compute each initial value in a loop over the outer index before
+        // the reconstructed loop. A value computed in the loop is cloned with
+        // `induction` replaced by the counter; one from outside the loop is
+        // the same for every element. The result, widened for a bool phi, is
+        // stored to the phi's buffer.
+        SmallVector<Instruction *> chain;
+        SmallPtrSet<Instruction *, 8> seen;
+        if (inLoop)
           collectInitChain(initInst, L, induction, chain, seen);
-          BasicBlock *initEnd =
-              SplitBlock(preheader, preheader->getTerminator());
-          BasicBlock *initLoop = BasicBlock::Create(
-              header->getContext(), "reconInit", header->getParent(), initEnd);
-          preheader->getTerminator()->eraseFromParent();
-          Builder.SetInsertPoint(preheader);
-          Value *count =
-              Builder.CreateZExtOrTrunc(outerCount, Builder.getInt64Ty());
-          Builder.CreateCondBr(Builder.CreateICmpSGT(count, Builder.getInt64(0)),
-                               initLoop, initEnd);
-          Builder.SetInsertPoint(initLoop);
-          PHINode *k = Builder.CreatePHI(Builder.getInt64Ty(), 2);
-          k->addIncoming(Builder.getInt64(0), preheader);
-          DenseMap<Value *, Value *> map;
-          map[induction] = Builder.CreateZExtOrTrunc(k, induction->getType());
-          for (Instruction *I : chain) {
-            Instruction *C = I->clone();
-            for (Use &U : C->operands())
-              if (Value *M = map.lookup(U.get()))
-                U.set(M);
-            Builder.Insert(C);
-            map[I] = C;
-          }
-          Value *wide = Builder.CreateZExtOrTrunc(map[initInst], type);
-          StoreInst *st =
-              Builder.CreateStore(wide, Builder.CreateGEP(type, storePtr, k));
-          if (secret) {
-            if (auto *W = dyn_cast<Instruction>(wide); W && W != map[initInst])
-              W->setMetadata("secret_shared", secret);
-            st->setMetadata("secret_shared", secret);
-          }
-          Value *next = Builder.CreateAdd(k, Builder.getInt64(1));
-          k->addIncoming(next, initLoop);
-          Builder.CreateCondBr(Builder.CreateICmpSLT(next, count), initLoop,
-                               initEnd);
-          // Later code inserts before the loop at the end of the preheader.
-          preheader = initEnd;
+        BasicBlock *initEnd = SplitBlock(preheader, preheader->getTerminator());
+        BasicBlock *initLoop = BasicBlock::Create(
+            header->getContext(), "reconInit", header->getParent(), initEnd);
+        preheader->getTerminator()->eraseFromParent();
+        Builder.SetInsertPoint(preheader);
+        Value *count =
+            Builder.CreateZExtOrTrunc(outerCount, Builder.getInt64Ty());
+        Builder.CreateCondBr(Builder.CreateICmpSGT(count, Builder.getInt64(0)),
+                             initLoop, initEnd);
+        Builder.SetInsertPoint(initLoop);
+        PHINode *k = Builder.CreatePHI(Builder.getInt64Ty(), 2);
+        k->addIncoming(Builder.getInt64(0), preheader);
+        DenseMap<Value *, Value *> map;
+        map[induction] = Builder.CreateZExtOrTrunc(k, induction->getType());
+        for (Instruction *I : chain) {
+          Instruction *C = I->clone();
+          for (Use &U : C->operands())
+            if (Value *M = map.lookup(U.get()))
+              U.set(M);
+          Builder.Insert(C);
+          map[I] = C;
         }
-        initialized = true;
+        Value *value = inLoop ? map[initInst] : init;
+        Value *wide = Builder.CreateZExtOrTrunc(value, type);
+        StoreInst *st =
+            Builder.CreateStore(wide, Builder.CreateGEP(type, storePtr, k));
+        if (secret) {
+          if (auto *W = dyn_cast<Instruction>(wide); W && W != value)
+            W->setMetadata("secret_shared", secret);
+          st->setMetadata("secret_shared", secret);
+        }
+        Value *next = Builder.CreateAdd(k, Builder.getInt64(1));
+        k->addIncoming(next, initLoop);
+        Builder.CreateCondBr(Builder.CreateICmpSLT(next, count), initLoop,
+                             initEnd);
+        // Later code inserts before the loop at the end of the preheader.
+        preheader = initEnd;
       }
 
       Builder.SetInsertPoint(header->getFirstNonPHI());
-      auto gep =
-          Builder.CreateGEP(type, innerPhiStorePtrs[originalPhi], induction);
-      LoadInst *bufLoad = Builder.CreateLoad(type, gep);
-      if (initialized && secret)
+      auto bufGep = Builder.CreateGEP(type, storePtr, induction);
+      LoadInst *bufLoad = Builder.CreateLoad(type, bufGep);
+      if (secret)
         bufLoad->setMetadata("secret_shared", secret);
       Value *val = bufLoad;
-      if (newStorePtrs.find(innerPhiStorePtrs[originalPhi]) !=
-          newStorePtrs.end()) {
+      if (newStorePtrs.find(storePtr) != newStorePtrs.end()) {
         Builder.SetInsertPoint(header->getTerminator());
-        Builder.CreateStore(originalPhi->getIncomingValueForBlock(header), gep);
+        Builder.CreateStore(originalPhi->getIncomingValueForBlock(header),
+                            bufGep);
       }
       if (originalPhi->getType() == Builder.getInt1Ty())
         val = Builder.CreateTrunc(val, Builder.getInt1Ty());
@@ -488,42 +485,6 @@ bool MPCLoopReconstructPass::processLoop(Loop *L) {
           dyn_cast<Instruction>(originalPhi->getUniqueUndroppableUser());
       user->replaceAllUsesWith(val);
       user->eraseFromParent();
-      if (initialized) {
-        originalPhi->eraseFromParent();
-        continue;
-      }
-      Builder.SetInsertPoint(preheader->getTerminator());
-      llvm::Function *storeFunc = cast<llvm::Function>(
-          header->getParent()
-              ->getParent()
-              ->getOrInsertFunction(
-                  "_ZN3MPC5storeEPvS0_iibb",
-                  FunctionType::get(Type::getVoidTy(header->getContext()),
-                                    {Builder.getPtrTy(), Builder.getPtrTy(),
-                                     Builder.getInt32Ty(), Builder.getInt32Ty(),
-                                     Builder.getInt1Ty(), Builder.getInt1Ty()},
-                                    false))
-              .getCallee());
-      Value *elementPtr = Builder.CreateAlloca(type, Builder.getInt32(1), "");
-      Value *toStore = Builder.CreateZExtOrTrunc(innerPhi.second, type);
-      Builder.CreateStore(toStore, elementPtr);
-      Value *n = Builder.CreateTruncOrBitCast(outerCount, Builder.getInt32Ty());
-      int elementSize =
-          header->getParent()->getParent()->getDataLayout().getTypeAllocSize(
-              type);
-      bool storeValInAllParties = true;
-      if (originalPhi->hasMetadata("secret_shared")) {
-        if (Instruction *I = dyn_cast<Instruction>(innerPhi.second)) {
-          if (!I->hasMetadata("secret_shared"))
-            storeValInAllParties = false;
-        } else
-          storeValInAllParties = false;
-      }
-
-      Builder.CreateCall(storeFunc, {innerPhiStorePtrs[originalPhi], elementPtr,
-                                     n, Builder.getInt32(elementSize),
-                                     Builder.getInt1(storeValInAllParties),
-                                     Builder.getInt1(false)});
       originalPhi->eraseFromParent();
     }
   }

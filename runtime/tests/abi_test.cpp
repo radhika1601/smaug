@@ -64,7 +64,7 @@ Vals unpack(const std::vector<uint8_t> &b, uint32_t w, uint64_t n) {
 void *secret(const Vals &v, uint32_t w) {
   Vals pad = randomVals(w, v.size()), share(v.size());
   for (size_t i = 0; i < v.size(); ++i)
-    share[i] = MPC::party == 1 ? v[i] ^ pad[i] : pad[i];
+    share[i] = smaug_party() == 1 ? v[i] ^ pad[i] : pad[i];
   void *b = smaug_alloc(w, v.size());
   auto p = pack(share, w);
   smaug_import(w, b, p.data(), v.size());
@@ -84,7 +84,7 @@ void check(const std::string &what, const Vals &got, const Vals &want) {
   ++failures;
   for (size_t i = 0; i < want.size(); ++i)
     if (got[i] != want[i]) {
-      if (MPC::party == 1)
+      if (smaug_party() == 1)
         printf("FAIL %s [%zu]: got %llx want %llx\n", what.c_str(), i,
                (unsigned long long)got[i], (unsigned long long)want[i]);
       break;
@@ -359,7 +359,7 @@ void checkFloat(const std::string &what, const Vals &got,
     float g = ffloat(got[i]), e = want[i];
     if (std::fabs(g - e) > 1e-4f * std::fmax(1.0f, std::fabs(e))) {
       ++failures;
-      if (MPC::party == 1)
+      if (smaug_party() == 1)
         printf("FAIL %s [%zu]: got %g want %g\n", what.c_str(), i, g, e);
       return;
     }
@@ -468,7 +468,7 @@ int main(int argc, char **argv) {
     testOblivious();
   if (want("float"))
     testFloat();
-  if (MPC::party == 1)
+  if (smaug_party() == 1)
     printf("%d checks, %d failures\n", checks, failures);
   MPC::finish();
   return failures ? 1 : 0;
